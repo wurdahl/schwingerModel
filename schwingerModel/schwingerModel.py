@@ -33,45 +33,6 @@ class schwingerModel:
 
         self.hmcChain()
 
-    
-    def apply_D(self, vector=np.full(4*4*2,1+0j), gaugeLinks=np.full((4,4,2),1+0j)):
-        pseudoField = np.reshape(vector, (self.dimx, self.dimt, 2))
-        
-        outputVector = np.zeros((self.dimx, self.dimt, 2), dtype=np.complex128)
-        I = np.diag([1, 1])
-
-        for x in range(self.dimx):
-            for t in range(self.dimt):
-                xp1 = (x + 1) % self.dimx
-                xm1 = (x - 1) % self.dimx
-                tp1 = (t + 1) % self.dimt
-                tm1 = (t - 1) % self.dimt
-
-                # Anti-periodic boundary conditions for fermions in time
-                bc_fw_t = -1.0 if t == self.dimt - 1 else 1.0
-                bc_bw_t = -1.0 if t == 0 else 1.0
-
-                # Mass term of Dirac operator
-                outputVector[x, t, :] = (self.fMass + 2/self.a) * pseudoField[x, t, :]
-
-                # KINETIC ENERGY TERMS
-                
-                # +x direction (forward): (I - gammax) * U_x(x,t) * phi(x+1,t)
-                # Space links are index 1
-                outputVector[x, t, :] -= (1/(2*self.a)) * (I - self.gammax) @ pseudoField[xp1, t, :] * gaugeLinks[x, t, 1]
-                
-                # -x direction (backward): (I + gammax) * U_x^\dagger(x-1,t) * phi(x-1,t)
-                outputVector[x, t, :] -= (1/(2*self.a)) * (I + self.gammax) @ pseudoField[xm1, t, :] * np.conjugate(gaugeLinks[xm1, t, 1])
-
-                # +t direction (forward): (I - gammat) * U_t(x,t) * phi(x,t+1)
-                # Time links are index 0
-                outputVector[x, t, :] -= bc_fw_t * (1/(2*self.a)) * (I - self.gammat) @ pseudoField[x, tp1, :] * gaugeLinks[x, t, 0]
-                
-                # -t direction (backward): (I + gammat) * U_t^\dagger(x,t-1) * phi(x,t-1)
-                outputVector[x, t, :] -= bc_bw_t * (1/(2*self.a)) * (I + self.gammat) @ pseudoField[x, tm1, :] * np.conjugate(gaugeLinks[x, tm1, 0])
-
-        return outputVector.flatten()
-
     def apply_D_vectorized(self, vector=np.full(4*4*2,1+0j), gaugeLinks=np.full((4,4,2),1+0j),dagger=False):
         phi = np.reshape(vector, (self.dimx, self.dimt, 2))
         out = np.zeros_like(phi, dtype=np.complex128)
@@ -128,43 +89,6 @@ class schwingerModel:
         out -= (1/(2*self.a)) * (term_xp1 + term_xm1 + term_tp1 + term_tm1)
         return out.flatten()
 
-    
-    def apply_Ddagger(self, vector=np.full(4*4*2,1+0j), gaugeLinks=np.full((4,4,2),1+0j)):
-        pseudoField = np.reshape(vector, (self.dimx, self.dimt, 2))
-        outputVector = np.zeros((self.dimx, self.dimt, 2), dtype=np.complex128)
-        I = np.diag([1, 1])
-
-        for x in range(self.dimx):
-            for t in range(self.dimt):
-                xp1 = (x + 1) % self.dimx
-                xm1 = (x - 1) % self.dimx
-                tp1 = (t + 1) % self.dimt
-                tm1 = (t - 1) % self.dimt
-
-                bc_fw_t = -1.0 if t == self.dimt - 1 else 1.0
-                bc_bw_t = -1.0 if t == 0 else 1.0
-
-                # Mass term remains identical
-                outputVector[x, t, :] = (self.fMass + 2/self.a) * pseudoField[x, t, :]
-
-                # EXACT ADJOINT KINETIC TERMS
-                # Swaps (I - gamma) with (I + gamma)
-                
-                # +x direction (forward): Uses (I + gammax)
-                outputVector[x, t, :] -= (1/(2*self.a)) * (I + self.gammax) @ pseudoField[xp1, t, :] * gaugeLinks[x, t, 1]
-                
-                # -x direction (backward): Uses (I - gammax)
-                outputVector[x, t, :] -= (1/(2*self.a)) * (I - self.gammax) @ pseudoField[xm1, t, :] * np.conjugate(gaugeLinks[xm1, t, 1])
-
-                # +t direction (forward): Uses (I + gammat)
-                outputVector[x, t, :] -= bc_fw_t * (1/(2*self.a)) * (I + self.gammat) @ pseudoField[x, tp1, :] * gaugeLinks[x, t, 0]
-                
-                # -t direction (backward): Uses (I - gammat)
-                outputVector[x, t, :] -= bc_bw_t * (1/(2*self.a)) * (I - self.gammat) @ pseudoField[x, tm1, :] * np.conjugate(gaugeLinks[x, tm1, 0])
-
-        return outputVector.flatten()
-    
-    
     def apply_D_Ddagger(self,vector=np.full(4*4*2,1+0j),gaugeLinks = np.full((4,4,2),1+0j)):
         return self.apply_D_vectorized(self.apply_D_vectorized(vector,gaugeLinks, dagger=True),gaugeLinks)
     
@@ -244,7 +168,7 @@ class schwingerModel:
             raise RuntimeError(f"Conjugate Gradient failed to converge! Exit code: {exitcode}")
         
         #Y = D^\dagger X
-        Y = self.apply_Ddagger(X, gaugeLinks)
+        Y = self.apply_D_vectorized(X, gaugeLinks,dagger=True)
 
         Y = np.reshape(Y,(self.dimx,self.dimt,2))
         X = np.reshape(X,(self.dimx,self.dimt,2))
@@ -292,7 +216,7 @@ class schwingerModel:
         #generate pseduofermions field:
         chi = self.rng.normal(loc=0,scale=1/np.sqrt(2),size=(self.dimx*self.dimt*2))+1j*self.rng.normal(loc=0,scale=1/np.sqrt(2),size=(self.dimx*self.dimt*2))
 
-        phi = self.apply_D(chi,self.gaugeLinks)
+        phi = self.apply_D_vectorized(chi,self.gaugeLinks)
 
         #generate initial value for conjugate field
         conjPInitial = self.rng.normal(loc=0,scale=1,size=(self.dimx,self.dimt,2))

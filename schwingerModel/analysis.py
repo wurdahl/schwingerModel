@@ -2,6 +2,7 @@ import numpy as np
 import scipy.sparse as sparse
 from scipy.stats import bootstrap
 from scipy.optimize import curve_fit
+from tqdm import tqdm
 
 from .schwingerModel import schwingerModel
 
@@ -28,7 +29,7 @@ def plaqStats(modelObj: schwingerModel, burnIn=1):
     for i in range(modelObj.metroSteps):
         plaqAvgs[i] = getPlaqAvg(modelObj.linkHistory[i])
     
-    burnedInAvgs = modelObj.plaqAvgs[burnIn:]
+    burnedInAvgs = plaqAvgs[burnIn:]
 
     return np.array([np.mean(burnedInAvgs),np.std(burnedInAvgs)/np.sqrt(len(burnedInAvgs))])
 
@@ -39,7 +40,7 @@ def correlStats(modelObj,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0,-1j]])
     acceptedCorrel_disc = []
     source_trace = []
 
-    for i in range(burnIn,modelObj.metroSteps,autocorrSkip):
+    for i in tqdm(range(burnIn,modelObj.metroSteps,autocorrSkip)):
         Cconn, Cdisc, sTrace = getCorrelation(modelObj, modelObj.linkHistory[i],Gamma)
         
         acceptedCorrel_conn.append(Cconn)
@@ -67,12 +68,12 @@ def correlStats(modelObj,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0,-1j]])
     
     return [totalCorrelMean,totalCorrelErr]
 
-def effectiveMassStats(modelObj,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0,-1j]]), includeDisc = True):
+def effectiveMassStats(modelObj,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0,-1j]]), includeDisc = True, coshExpr = True):
     acceptedCorrel_conn = []
     acceptedCorrel_disc = []
     source_trace = []
 
-    for i in range(burnIn,modelObj.metroSteps,autocorrSkip):
+    for i in tqdm(range(burnIn,modelObj.metroSteps,autocorrSkip)):
         Cconn, Cdisc, sTrace = getCorrelation(modelObj,modelObj.linkHistory[i],Gamma)
         
         acceptedCorrel_conn.append(Cconn)
@@ -92,17 +93,19 @@ def effectiveMassStats(modelObj,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0
 
     #find effective mass curves for each of these correlations
 
-    numerators = totalCorrels[:,2:] + totalCorrels[:,:-2]
-    denominators = 2 * totalCorrels[:,1:-1]
+    if(coshExpr):
+        numerators = totalCorrels[:,2:] + totalCorrels[:,:-2]
+        denominators = 2 * totalCorrels[:,1:-1]
 
-    # 3. Calculate the cosh-based effective mass
-    effectiveMass = np.arccosh(numerators / denominators)
+        effectiveMass = np.arccosh(numerators / denominators)
+    else:
+        effectiveMass = np.log(totalCorrels[:,:-1]/totalCorrels[:,1:])
 
     effectiveMassMean = np.mean(effectiveMass,axis=0)
 
-    effectiveMassErr = np.zeros((modelObj.dimt-2,2))
+    effectiveMassErr = np.zeros((len(effectiveMassMean),2))
 
-    for i in range(modelObj.dimt-2):
+    for i in range(len(effectiveMassMean)):
         bootstrapRes = bootstrap((effectiveMass[:,i],), np.mean, confidence_level=.95, rng=modelObj.rng)
         effectiveMassErr[i] = np.abs(bootstrapRes.confidence_interval - effectiveMassMean[i])
     
