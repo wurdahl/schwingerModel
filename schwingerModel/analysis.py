@@ -68,7 +68,7 @@ def correlStats(modelObj,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0,-1j]])
     
     return [totalCorrelMean,totalCorrelErr]
 
-def effectiveMassStats(modelObj,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0,-1j]]), includeDisc = True, coshExpr = True):
+def effectiveMassStats(modelObj,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0,-1j]]), includeDisc = True, coshExpr = True, cleanNans = False):
     acceptedCorrel_conn = []
     acceptedCorrel_disc = []
     source_trace = []
@@ -106,7 +106,11 @@ def effectiveMassStats(modelObj,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0
     effectiveMassErr = np.zeros((len(effectiveMassMean),2))
 
     for i in range(len(effectiveMassMean)):
-        bootstrapRes = bootstrap((effectiveMass[:,i],), np.mean, confidence_level=.95, rng=modelObj.rng)
+        if(cleanNans):
+            bootstrapRes = bootstrap((effectiveMass[:,i],), np.nanmean, confidence_level=.95, rng=modelObj.rng)
+        else:
+            bootstrapRes = bootstrap((effectiveMass[:,i],), np.mean, confidence_level=.95, rng=modelObj.rng)
+
         effectiveMassErr[i] = np.abs(bootstrapRes.confidence_interval - effectiveMassMean[i])
     
     return [effectiveMassMean,effectiveMassErr]

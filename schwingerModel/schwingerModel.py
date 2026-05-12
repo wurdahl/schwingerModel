@@ -10,13 +10,14 @@ from tqdm import tqdm
 
 class schwingerModel:
 
-    def __init__(self, dimx = 4, dimt=4, metroSteps = 100, beta = 10, epsilon=1, fMass = 1, aSpacing=1,cgRtol = 1e-10):
+    def __init__(self, dimx = 4, dimt=4, metroSteps = 100, beta = 10, epsilon=1, fMass = 1, aSpacing=1,cgRtol = 1e-10, randSeed=0):
 
         #define gamma matrices
         self.gammax = np.array([[0,1],[1,0]])
         self.gammat = np.array([[0,-1j],[1j,0]])
-
-        self.rng = np.random.default_rng(0)
+        
+        self.randSeed = randSeed
+        self.rng = np.random.default_rng(randSeed)
 
         self.dimx = dimx
         self.dimt = dimt
@@ -30,6 +31,9 @@ class schwingerModel:
         self.gaugeLinks = np.full((dimx,dimt,2),1+0j)
 
         self.linkHistory = np.zeros((self.metroSteps, self.dimx,self.dimt, 2),dtype="complex128")
+
+        #used to store conjugate gradient answers during one trajectory
+        self.previous_CG_ans = None
 
         self.hmcChain()
 
@@ -162,7 +166,10 @@ class schwingerModel:
         diracOp = LinearOperator((self.dimx*self.dimt*2,self.dimx*self.dimt*2), matvec = matvec_wrapper)
 
         #X is (D D^\dagger)\phi
-        X, exitcode = cg(diracOp,phis,rtol=self.cgRtol)
+        x0 = self.previous_CG_ans if self.previous_CG_ans is not None else np.zeros_like(phis)
+        X, exitcode = cg(diracOp, phis, x0=x0, rtol=self.cgRtol)
+        #save X to use on next iteration
+        self.previous_CG_ans = X
 
         if exitcode != 0:
             raise RuntimeError(f"Conjugate Gradient failed to converge! Exit code: {exitcode}")
@@ -210,6 +217,9 @@ class schwingerModel:
     def hmcStep(self, numSubSteps=100):
         #copy current gauge configuration
         gaugeLinksCopy = np.copy(self.gaugeLinks)
+
+        #used to store conjugate gradient answers during one trajectory
+        self.previous_CG_ans = None
 
         epsilon=1/numSubSteps
 
