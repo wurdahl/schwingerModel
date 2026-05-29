@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 class schwingerModel:
 
-    def __init__(self, dimx = 4, dimt=4, metroSteps = 100, beta = 10, epsilon=1, fMass = 1, aSpacing=1,cgRtol = 1e-10, randSeed=0):
+    def __init__(self, dimx = 4, dimt=4, metroSteps = 100, beta = 10, fMass = 1, aSpacing=1,cgRtol = 1e-10, randSeed=0):
 
         #define gamma matrices
         self.gammax = np.array([[0,1],[1,0]])
@@ -23,7 +23,6 @@ class schwingerModel:
         self.dimt = dimt
         self.metroSteps = metroSteps
         self.beta = beta
-        self.epsilon = epsilon
         self.fMass = fMass
         self.a = aSpacing
         self.cgRtol = cgRtol
