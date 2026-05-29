@@ -34,7 +34,46 @@ def plaqStats(modelObj: schwingerModel, burnIn=1):
     return np.array([np.mean(burnedInAvgs),np.std(burnedInAvgs)/np.sqrt(len(burnedInAvgs))])
 
 
-def correlStats(modelObj: schwingerModel, burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0,-1j]]), includeDisc = False, chemicalPot = 0, k=0):
+def correlStats(modelObj: schwingerModel, burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0,-1j]]),
+                 includeDisc = False, chemicalPot = 0, k=0,
+                   smearing=False, kappa=.1, smearingSteps=1):
+    """Compute the ensemble-averaged meson correlator with bootstrap errors.
+
+    Loops over gauge configurations (skipping burn-in and thinning by
+    autocorrSkip), evaluates the connected (and optionally disconnected)
+    correlator on each, then returns the weighted mean and 95% bootstrap
+    confidence interval.
+
+    Parameters
+    ----------
+    modelObj : schwingerModel
+        Lattice model containing gauge link history and parameters.
+    burnIn : int
+        Number of initial configurations to discard as thermalization.
+    autocorrSkip : int
+        Stride between configurations to reduce autocorrelations.
+    Gamma : (2,2) complex array
+        Dirac structure at source and sink.
+    includeDisc : bool
+        If True, add the disconnected diagram and subtract the VEV squared.
+    chemicalPot : float
+        Chemical potential for phase-reweighting. Zero disables reweighting.
+    k : int
+        Spatial momentum mode for projection. If nonzero, each configuration
+        is evaluated at both +k and -k and the weights are doubled accordingly.
+    smearing : bool
+        If True, apply Jacobi smearing to source and sink via smearedPropagator.
+    kappa : float
+        Jacobi smearing weight parameter.
+    smearingSteps : int
+        Number of Jacobi smearing steps (power-series order).
+
+    Returns
+    -------
+    [mean, errors] where
+        mean   : (dimt,) array, real part of the weighted-average correlator.
+        errors : (2, dimt) array, [upper, lower] 95% bootstrap CI half-widths.
+    """
     acceptedCorrel_conn = []
     acceptedCorrel_disc = []
     source_trace = []
@@ -47,14 +86,16 @@ def correlStats(modelObj: schwingerModel, burnIn,autocorrSkip=1, Gamma=np.array(
         weightsMu = np.repeat(weightsMu,2)
 
     for i in tqdm(range(burnIn,modelObj.metroSteps,autocorrSkip)):
-        Cconn, Cdisc, sTrace = getCorrelation(modelObj, modelObj.linkHistory[i],Gamma, k=k)
+        Cconn, Cdisc, sTrace = getCorrelation(modelObj, modelObj.linkHistory[i],Gamma, k=k,
+                                              smearing=smearing, kappa=kappa, smearingSteps=smearingSteps)
         
         acceptedCorrel_conn.append(Cconn)
         acceptedCorrel_disc.append(Cdisc)
         source_trace.append(sTrace)
 
         if(k!=0):
-            Cconn, Cdisc, sTrace = getCorrelation(modelObj, modelObj.linkHistory[i],Gamma, k=-k)
+            Cconn, Cdisc, sTrace = getCorrelation(modelObj, modelObj.linkHistory[i],Gamma, k=-k,
+                                              smearing=smearing, kappa=kappa, smearingSteps=smearingSteps)
         
             acceptedCorrel_conn.append(Cconn)
             acceptedCorrel_disc.append(Cdisc)
@@ -313,12 +354,58 @@ def buildDiracOp(modelObj, gaugeLinks, chemicalPot=0):
 
     return Dee
 
+def jacobiSmearingH(modelObj: schwingerModel, gaugeLinks):
+    #dirac dimensions
+    dimD = 2
+    eyeD = np.eye(dimD)
 
-def getCorrelation(modelObj,gaugeLinks,Gamma=np.array([[1j,0],[0,-1j]]), k=0):
+    shift_x_1Dpos = np.roll(np.eye(modelObj.dimx), -1, axis=0) # This is \delta_{x_n+1, x_m}
+    shift_x_1Dneg = np.roll(np.eye(modelObj.dimx), +1, axis=0) # This is \delta_{x_n+1, x_m}
+    time_identity = np.eye(modelObj.dimt)                      # This is \delta_{t_n, t_m}
 
-    dOp = buildDiracOp(modelObj, gaugeLinks)
+    #space-time shift operators
+    T_x_pos = sparse.kron(shift_x_1Dpos, time_identity)
+    T_x_neg = sparse.kron(shift_x_1Dneg, time_identity)
 
-    prop = np.linalg.inv(dOp.toarray())
+    #flattened gaugelinks
+    spaceLinks = np.diag(gaugeLinks[:,:,1].flatten())
+
+    #H matrix for smearing
+    H = sparse.kron(spaceLinks@T_x_pos, eyeD) + sparse.kron(T_x_neg@np.conj(spaceLinks),eyeD)
+
+    return H
+
+def jacobiSmearingOp(modelObj: schwingerModel, gaugeLinks, kappa = .1, smearingSteps=1):
+
+    jacobiH = jacobiSmearingH(modelObj, gaugeLinks)
+
+    jacobiM = np.identity(jacobiH.shape[0], dtype=np.complex128)
+
+    if(smearingSteps>1):
+        for n in range(1, smearingSteps):
+            jacobiM += kappa**n * np.linalg.matrix_power(jacobiH.toarray(),n)
+    
+    return jacobiM
+
+def smearedPropagator(modelObj: schwingerModel, gaugeLinks, kappa=.1, smearingSteps=1, chemicalPot=0):
+    Dee = buildDiracOp(modelObj, gaugeLinks, chemicalPot)
+
+    fullProp = np.linalg.inv(Dee.toarray())
+    
+    jacobiM = jacobiSmearingOp(modelObj, gaugeLinks, kappa, smearingSteps)
+
+    smearedProp = jacobiM@fullProp@jacobiM
+
+    return smearedProp
+
+def getCorrelation(modelObj,gaugeLinks,Gamma=np.array([[1j,0],[0,-1j]]), k=0, smearing=False, kappa= .1, smearingSteps=1):
+
+    if(smearing):
+        prop = smearedPropagator(modelObj, gaugeLinks, kappa, smearingSteps)
+    else:
+        dOp = buildDiracOp(modelObj, gaugeLinks)
+
+        prop = np.linalg.inv(dOp.toarray())
 
     stridex = modelObj.dimt*2
     stridet = 2
