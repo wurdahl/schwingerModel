@@ -5,6 +5,8 @@ from scipy.optimize import curve_fit
 from tqdm import tqdm
 
 from .schwingerModel import schwingerModel
+from . import buildOps as ops
+from . import correlation as corr
 
 def getPlaqAvg(gaugeLinks):
     Ut = gaugeLinks[:,:,0] # Time links (shape: dimx, dimt)
@@ -196,19 +198,40 @@ def effectiveMassStats(modelObj,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0
 
     return [effectiveMassMean, np.array([high-effectiveMassMean, effectiveMassMean-low])]
 
-def effectiveMassProp(correlStats):
+def effectiveMassProp(correlStats, coshExpr=False):    
     #extract Correlation function
     cFunc = correlStats[0]
+    cFuncErr = np.mean(correlStats[1],axis=0)
 
-    effectiveMass = np.log(np.array(cFunc[:-1])/np.array(cFunc[1:]))
+    if(not coshExpr):
+        effectiveMass = np.log(np.array(cFunc[:-1])/np.array(cFunc[1:]))
 
-    cFuncFracError = np.mean(correlStats[1],axis=0)/cFunc
+        cFuncFracError = cFuncErr/cFunc
 
-    effectiveMassErr = np.sqrt(cFuncFracError[:-1]**2+cFuncFracError[1:]**2)
+        effectiveMassErr = np.sqrt(cFuncFracError[:-1]**2+cFuncFracError[1:]**2)
+    else:
+        x1=cFunc[2:]
+        x2=cFunc[1:-1]
+        x3=cFunc[:-2]
+
+        numerators = x1 + x3
+        denominators = 2 * x2
+
+        effectiveMass = np.arccosh(numerators / denominators)
+
+        dx1Sq=cFuncErr[2:]**2
+        dx2Sq=cFuncErr[1:-1]**2
+        dx3Sq=cFuncErr[:-2]**2
+        
+        numerators = dx1Sq+(dx3Sq* x2**2+ dx2Sq*(x1+x3)**2)/x2**2
+        denominators = (x1-2*x2+x3)*(x1+2*x2+x3)
+
+        effectiveMassErr = np.sqrt(numerators/denominators)
 
     return [effectiveMass,effectiveMassErr]
 
-def numDensityStats(modelObj, burnIn, autocorrSkip=1, chemicalPot=0.0, naive=False):
+
+def numDensityStats(modelObj, burnIn, autocorrSkip=1, chemicalPot=0.0):
     V = modelObj.a**2*modelObj.dimx * modelObj.dimt
 
     # reweighting factors for finite mu
@@ -222,28 +245,19 @@ def numDensityStats(modelObj, burnIn, autocorrSkip=1, chemicalPot=0.0, naive=Fal
     n_mu_samples = []
     n_0_samples  = []   # vacuum subtraction
 
-    if(naive):
-        for i in tqdm(range(burnIn, modelObj.metroSteps, autocorrSkip)):
-            links = modelObj.linkHistory[i]
-            S_mu = np.linalg.inv(buildDiracOp(modelObj, links, chemicalPot).toarray())
-            S_0  = np.linalg.inv(buildDiracOp(modelObj, links, 0.0).toarray())
+    for i in tqdm(range(burnIn, modelObj.metroSteps, autocorrSkip)):
+        links = modelObj.linkHistory[i]
 
-            n_mu_samples.append(_density_from_prop(modelObj, S_mu))
-            n_0_samples.append(_density_from_prop(modelObj, S_0))
-    else:
-        for i in tqdm(range(burnIn, modelObj.metroSteps, autocorrSkip)):
-            links = modelObj.linkHistory[i]
+        #build dirac props
+        S_mu = np.linalg.inv(ops.buildDiracOp(modelObj, links, chemicalPot).toarray())
+        S_0  = np.linalg.inv(ops.buildDiracOp(modelObj, links, 0.0).toarray())
 
-            #build dirac props
-            S_mu = np.linalg.inv(buildDiracOp(modelObj, links, chemicalPot).toarray())
-            S_0  = np.linalg.inv(buildDiracOp(modelObj, links, 0.0).toarray())
+        #build number density operators
+        n_mu = ops.buildNumberDensOp(modelObj, links, chemicalPot).toarray()
+        n_0 = ops.buildNumberDensOp(modelObj, links, 0.0).toarray()
 
-            #build number density operators
-            n_mu = buildNumberDensOp(modelObj, links, chemicalPot).toarray()
-            n_0 = buildNumberDensOp(modelObj, links, 0.0).toarray()
-
-            n_mu_samples.append(np.trace(S_mu@n_mu)/V)
-            n_0_samples.append(np.trace(S_0@n_0)/V)
+        n_mu_samples.append(np.trace(S_mu@n_mu)/V)
+        n_0_samples.append(np.trace(S_0@n_0)/V)
 
     n_mu_samples = np.array(n_mu_samples)
     n_0_samples  = np.array(n_0_samples)
@@ -273,137 +287,12 @@ def numDensityStats(modelObj, burnIn, autocorrSkip=1, chemicalPot=0.0, naive=Fal
     return [np.real(mean), np.real(np.array([high-mean, mean-low])), validity]
 
 
-def _density_from_prop(modelObj, S):
-    """Local fermion number density: -(1/V) sum_{x,t} Tr[gamma_t S(x,t;x,t)]"""
-    stridex = modelObj.dimt * 2
-    stridet = 2
-    V = modelObj.a**2*modelObj.dimx * modelObj.dimt
-    gt = modelObj.gammat
-
-    total = 0.0 + 0.0j
-    for t in range(modelObj.dimt):
-        for x in range(modelObj.dimx):
-            a = x * stridex + t * stridet
-            total += -np.trace(gt @ S[a:a+2, a:a+2])
-
-    return total / V
-
-def buildNumberDensOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
-    #dirac dimensions
-    dimD = 2
-    eyeD = np.eye(dimD)
-
-    shift_t_1Dpos = np.roll(np.eye(modelObj.dimt), -1, axis=0)
-    shift_t_1Dneg = np.roll(np.eye(modelObj.dimt), +1, axis=0)
-    space_identity = np.eye(modelObj.dimx)
-
-    #anti-periodic boundary conditions for fermions in time
-    shift_t_1Dpos[modelObj.dimt - 1, 0] = -1.0
-    shift_t_1Dneg[0, modelObj.dimt - 1] = -1.0
-
-    #space-time shift operators
-
-    T_t_pos = sparse.kron(space_identity, shift_t_1Dpos)
-    T_t_neg = sparse.kron(space_identity, shift_t_1Dneg)
-
-    #flattened gaugelinks
-    timeLinks = np.diag(gaugeLinks[:,:,0].flatten())
-
-    nOp=-1/(2) * sparse.kron(timeLinks@T_t_pos, eyeD-modelObj.gammat)*np.exp(modelObj.a*chemicalPot)
-    #negative shifts
-    nOp+=1/(2) * sparse.kron(T_t_neg@np.conj(timeLinks),eyeD+modelObj.gammat)*np.exp(-modelObj.a*chemicalPot)
-
-    return nOp
-    
- #builds the dirac operator using the global gaugeLinks configuration
-# matrix is a square matrix with dimensional ordering (space, time, spin) 
-def buildDiracOp(modelObj, gaugeLinks, chemicalPot=0):
-    #dirac dimensions
-    dimD = 2
-    eyeD = np.eye(dimD)
-
-    shift_x_1Dpos = np.roll(np.eye(modelObj.dimx), -1, axis=0) # This is \delta_{x_n+1, x_m}
-    shift_t_1Dpos = np.roll(np.eye(modelObj.dimt), -1, axis=0)
-    shift_x_1Dneg = np.roll(np.eye(modelObj.dimx), +1, axis=0) # This is \delta_{x_n+1, x_m}
-    shift_t_1Dneg = np.roll(np.eye(modelObj.dimt), +1, axis=0)
-    time_identity = np.eye(modelObj.dimt)                      # This is \delta_{t_n, t_m}
-    space_identity = np.eye(modelObj.dimx)
-
-    #anti-periodic boundary conditions for fermions in time
-    shift_t_1Dpos[modelObj.dimt - 1, 0] = -1.0
-    shift_t_1Dneg[0, modelObj.dimt - 1] = -1.0
-
-    #space-time shift operators
-    T_x_pos = sparse.kron(shift_x_1Dpos, time_identity)
-    T_x_neg = sparse.kron(shift_x_1Dneg, time_identity)
-    T_t_pos = sparse.kron(space_identity, shift_t_1Dpos)
-    T_t_neg = sparse.kron(space_identity, shift_t_1Dneg)
-
-    #flattened gaugelinks
-    spaceLinks = np.diag(gaugeLinks[:,:,1].flatten())
-    timeLinks = np.diag(gaugeLinks[:,:,0].flatten())
-
-    #start building dirac operator matrix
-    Dee = (modelObj.fMass+2/modelObj.a)*sparse.kron(np.eye(modelObj.dimx), sparse.kron(np.eye(modelObj.dimt),eyeD))
-    #positive shifts
-    Dee-=1/(2*modelObj.a) * sparse.kron(spaceLinks@T_x_pos, eyeD-modelObj.gammax)
-    Dee-=1/(2*modelObj.a) * sparse.kron(timeLinks@T_t_pos, eyeD-modelObj.gammat)*np.exp(modelObj.a*chemicalPot)
-    #negative shifts
-    Dee-=1/(2*modelObj.a) * sparse.kron(T_x_neg@np.conj(spaceLinks),eyeD+modelObj.gammax)
-    Dee-=1/(2*modelObj.a) * sparse.kron(T_t_neg@np.conj(timeLinks),eyeD+modelObj.gammat)*np.exp(-modelObj.a*chemicalPot)
-
-    return Dee
-
-def jacobiSmearingH(modelObj: schwingerModel, gaugeLinks):
-    #dirac dimensions
-    dimD = 2
-    eyeD = np.eye(dimD)
-
-    shift_x_1Dpos = np.roll(np.eye(modelObj.dimx), -1, axis=0) # This is \delta_{x_n+1, x_m}
-    shift_x_1Dneg = np.roll(np.eye(modelObj.dimx), +1, axis=0) # This is \delta_{x_n+1, x_m}
-    time_identity = np.eye(modelObj.dimt)                      # This is \delta_{t_n, t_m}
-
-    #space-time shift operators
-    T_x_pos = sparse.kron(shift_x_1Dpos, time_identity)
-    T_x_neg = sparse.kron(shift_x_1Dneg, time_identity)
-
-    #flattened gaugelinks
-    spaceLinks = np.diag(gaugeLinks[:,:,1].flatten())
-
-    #H matrix for smearing
-    H = sparse.kron(spaceLinks@T_x_pos, eyeD) + sparse.kron(T_x_neg@np.conj(spaceLinks),eyeD)
-
-    return H
-
-def jacobiSmearingOp(modelObj: schwingerModel, gaugeLinks, kappa = .1, smearingSteps=1):
-
-    jacobiH = jacobiSmearingH(modelObj, gaugeLinks)
-
-    jacobiM = np.identity(jacobiH.shape[0], dtype=np.complex128)
-
-    if(smearingSteps>1):
-        for n in range(1, smearingSteps):
-            jacobiM += kappa**n * np.linalg.matrix_power(jacobiH.toarray(),n)
-    
-    return jacobiM
-
-def smearedPropagator(modelObj: schwingerModel, gaugeLinks, kappa=.1, smearingSteps=1, chemicalPot=0):
-    Dee = buildDiracOp(modelObj, gaugeLinks, chemicalPot)
-
-    fullProp = np.linalg.inv(Dee.toarray())
-    
-    jacobiM = jacobiSmearingOp(modelObj, gaugeLinks, kappa, smearingSteps)
-
-    smearedProp = jacobiM@fullProp@jacobiM
-
-    return smearedProp
-
 def getCorrelation(modelObj,gaugeLinks,Gamma=np.array([[1j,0],[0,-1j]]), k=0, smearing=False, kappa= .1, smearingSteps=1):
 
     if(smearing):
-        prop = smearedPropagator(modelObj, gaugeLinks, kappa, smearingSteps)
+        prop = ops.smearedPropagator(modelObj, gaugeLinks, kappa, smearingSteps)
     else:
-        dOp = buildDiracOp(modelObj, gaugeLinks)
+        dOp = ops.buildDiracOp(modelObj, gaugeLinks)
 
         prop = np.linalg.inv(dOp.toarray())
 
@@ -476,8 +365,8 @@ def getWeightingFactors(modelObj: schwingerModel, chemicalPot= 1,burnIn=1, autoc
 
     for i in range(burnIn,modelObj.metroSteps,autocorrSkip):
         currLinks = modelObj.linkHistory[i]
-        dOp = buildDiracOp(modelObj, currLinks).toarray()
-        dOpmu = buildDiracOp(modelObj, currLinks, chemicalPot).toarray()
+        dOp = ops.buildDiracOp(modelObj, currLinks).toarray()
+        dOpmu = ops.buildDiracOp(modelObj, currLinks, chemicalPot).toarray()
 
         sign_0, logdet_0 = np.linalg.slogdet(dOp)
         sign_mu, logdet_mu = np.linalg.slogdet(dOpmu)

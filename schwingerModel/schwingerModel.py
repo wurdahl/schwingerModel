@@ -31,6 +31,8 @@ class schwingerModel:
 
         self.linkHistory = np.zeros((self.metroSteps, self.dimx,self.dimt, 2),dtype="complex128")
 
+        self.storedProps = [None]*self.metroSteps
+
         #used to store conjugate gradient answers during one trajectory
         self.previous_CG_ans = None
 
@@ -210,6 +212,82 @@ class schwingerModel:
 
         return Force
     
+    def hmcForcingFunction_vec(self, gaugeLinks, phis):
+        Force = np.zeros((self.dimx, self.dimt, 2))
+
+        # --- CG solve (same as original) ---
+        matvec_wrapper = lambda v: self.apply_D_Ddagger(v, gaugeLinks)
+        diracOp = LinearOperator((self.dimx*self.dimt*2, self.dimx*self.dimt*2), matvec=matvec_wrapper)
+        x0 = self.previous_CG_ans if self.previous_CG_ans is not None else np.zeros_like(phis)
+        X, exitcode = cg(diracOp, phis, x0=x0, rtol=self.cgRtol)
+        self.previous_CG_ans = X
+        if exitcode != 0:
+            raise RuntimeError(f"Conjugate Gradient failed to converge! Exit code: {exitcode}")
+
+        Y = self.apply_D_vectorized(X, gaugeLinks, dagger=True)
+        Y = np.reshape(Y, (self.dimx, self.dimt, 2))
+        X = np.reshape(X, (self.dimx, self.dimt, 2))
+
+        I = np.eye(2, dtype=np.complex128)
+        c = 1j / (2 * self.a)
+
+        Ux = gaugeLinks[:, :, 1]  # (dimx, dimt)
+        Ut = gaugeLinks[:, :, 0]  # (dimx, dimt)
+
+        # --- Gauge force (vectorized staples) ---
+        Ux_tp1     = np.roll(Ux, shift=-1, axis=1)              # Ux[x, t+1]
+        Ut_xp1     = np.roll(Ut, shift=-1, axis=0)              # Ut[x+1, t]
+        Ux_xm1     = np.roll(Ux, shift=1,  axis=0)              # Ux[x-1, t]
+        Ux_xm1_tp1 = np.roll(Ux_tp1, shift=1, axis=0)          # Ux[x-1, t+1]
+        Ut_xm1     = np.roll(Ut, shift=1,  axis=0)              # Ut[x-1, t]
+
+        # Time links: right staple = Ux[x,t+1]*Ut*[x+1,t]*Ux*[x,t]
+        #             left staple  = Ux*[x-1,t+1]*Ut*[x-1,t]*Ux[x-1,t]
+        Astaple_t = (Ux_tp1 * np.conj(Ut_xp1) * np.conj(Ux)
+                     + np.conj(Ux_xm1_tp1) * np.conj(Ut_xm1) * Ux_xm1)
+        Force[:, :, 0] = self.beta * np.imag(Ut * Astaple_t)
+
+        Ut_tm1     = np.roll(Ut, shift=1,  axis=1)              # Ut[x, t-1]
+        Ut_xp1_tm1 = np.roll(Ut_xp1, shift=1, axis=1)          # Ut[x+1, t-1]
+        Ux_tm1     = np.roll(Ux, shift=1,  axis=1)              # Ux[x, t-1]
+
+        # Space links: top staple    = Ut[x+1,t]*Ux*[x,t+1]*Ut*[x,t]
+        #              bottom staple  = Ut*[x+1,t-1]*Ux*[x,t-1]*Ut[x,t-1]
+        Astaple_x = (Ut_xp1 * np.conj(Ux_tp1) * np.conj(Ut)
+                     + np.conj(Ut_xp1_tm1) * np.conj(Ux_tm1) * Ut_tm1)
+        Force[:, :, 1] = self.beta * np.imag(Ux * Astaple_x)
+
+        # --- Fermion force (vectorized inner products) ---
+        P_minus_x = I - self.gammax
+        P_plus_x  = I + self.gammax
+        P_minus_t = I - self.gammat
+        P_plus_t  = I + self.gammat
+
+        Y_xp1 = np.roll(Y, shift=-1, axis=0)  # Y[x+1, t, :]
+        X_xp1 = np.roll(X, shift=-1, axis=0)  # X[x+1, t, :]
+        Y_tp1 = np.roll(Y, shift=-1, axis=1)  # Y[x, t+1, :]
+        X_tp1 = np.roll(X, shift=-1, axis=1)  # X[x, t+1, :]
+
+        # Spatial: Z_x = -c*Ux * <X|P-_x|Y_{x+1}> + c*Ux* * <X_{x+1}|P+_x|Y>
+        Pm_x_Y_xp1 = np.einsum('ij,xyj->xyi', P_minus_x, Y_xp1)
+        Pp_x_Y     = np.einsum('ij,xyj->xyi', P_plus_x,  Y)
+        Z_x = (-c * Ux      * np.einsum('xyi,xyi->xy', np.conj(X),     Pm_x_Y_xp1)
+               + c * np.conj(Ux) * np.einsum('xyi,xyi->xy', np.conj(X_xp1), Pp_x_Y))
+        Force[:, :, 1] -= 2 * Z_x.real
+
+        # Time: Z_t = -c*Ut * <X|P-_t|Y_{t+1}> + c*Ut* * <X_{t+1}|P+_t|Y>
+        Pm_t_Y_tp1 = np.einsum('ij,xyj->xyi', P_minus_t, Y_tp1)
+        Pp_t_Y     = np.einsum('ij,xyj->xyi', P_plus_t,  Y)
+        Z_t = (-c * Ut      * np.einsum('xyi,xyi->xy', np.conj(X),     Pm_t_Y_tp1)
+               + c * np.conj(Ut) * np.einsum('xyi,xyi->xy', np.conj(X_tp1), Pp_t_Y))
+
+        # Anti-periodic boundary condition: flip sign at t = dimt-1
+        bc_t = np.ones((self.dimx, self.dimt))
+        bc_t[:, -1] = -1.0
+        Force[:, :, 0] -= 2 * Z_t.real * bc_t
+
+        return Force
+
     #do one step of an hmc metropolis algorithm
     #returns boolean of success of total step
     #if successful, replaces global value of gaugeLinks
@@ -231,13 +309,13 @@ class schwingerModel:
         conjPInitial = self.rng.normal(loc=0,scale=1,size=(self.dimx,self.dimt,2))
 
         #first momentum half step:
-        conjP = conjPInitial - epsilon/2 * self.hmcForcingFunction(gaugeLinksCopy,phi)
+        conjP = conjPInitial - epsilon/2 * self.hmcForcingFunction_vec(gaugeLinksCopy,phi)
         for i in range(numSubSteps-1):
             gaugeLinksCopy *= np.exp((1j)*epsilon *conjP)
-            conjP = conjP - epsilon * self.hmcForcingFunction(gaugeLinksCopy,phi)
+            conjP = conjP - epsilon * self.hmcForcingFunction_vec(gaugeLinksCopy,phi)
         #last step
         gaugeLinksCopy *= np.exp((1j)*epsilon *conjP)
-        conjP = conjP - epsilon/2 * self.hmcForcingFunction(gaugeLinksCopy,phi)
+        conjP = conjP - epsilon/2 * self.hmcForcingFunction_vec(gaugeLinksCopy,phi)
 
         metroFactor = np.exp(0.5*np.sum(conjPInitial**2)-0.5*np.sum(conjP**2)
                              +self.totalAction(self.gaugeLinks)-self.totalAction(gaugeLinksCopy)
