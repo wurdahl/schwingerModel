@@ -204,13 +204,16 @@ def GEVPStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
         np.sum(correl_boot * w_boot[:, :, np.newaxis], axis=1) /
         np.sum(w_boot, axis=1, keepdims=True)
     )
+    #calculate covariance matrix to allow for fitting
+    allcovs = np.array([np.cov(correl_boot[i],rowvar=False) for i in range(len(correl_boot))])
+    covMat = np.mean(allcovs, axis=0)
 
     low  = np.percentile(bootstrap_means, 2.5,  axis=0)
     high = np.percentile(bootstrap_means, 97.5, axis=0)
 
     totalCorrelMean = np.real(np.average(totalCorrels,axis=0,weights=weightsMu))
 
-    return [totalCorrelMean, np.array([high-totalCorrelMean, totalCorrelMean-low])]
+    return [totalCorrelMean, np.array([high-totalCorrelMean, totalCorrelMean-low]), covMat]
 
     
 def gevp(corr1, corr2, corrMixed, ti=1):
@@ -223,3 +226,12 @@ def gevp(corr1, corr2, corrMixed, ti=1):
     basis = np.mean(np.array([gevpOutput[i][0] for i in range(len(gevpOutput))]),axis=0)
 
     return newCorr, basis
+
+def gevpMassExtract(gevpStatsOut,fitT=10):
+    def expDecay(nt, Energy):
+        return np.exp(-nt*Energy)
+
+    fitMass = curve_fit(expDecay, xdata=np.arange(fitT), 
+                    ydata=gevpStatsOut[0][:fitT],sigma=gevpStatsOut[2][:fitT,:fitT],absolute_sigma=True)
+    
+    return np.array([fitMass[0][0], fitMass[1][0,0]])
