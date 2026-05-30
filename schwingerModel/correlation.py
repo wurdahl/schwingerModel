@@ -14,27 +14,31 @@ from . import analysis
 #this will allow for GEVP analysis
 #NOT the most efficient way - written this way to be closest to equations
 def getCorrelation(modelObj: schwingerModel, gaugleLinkIndex,
+                   smearingOp1, smearingOp2,
                     Gamma1=np.array([[1j,0],[0,-1j]]), Gamma2=np.array([[1j,0],[0,-1j]]),
-                    kappa1=.1, smearN1=1, kappa2=.1, smearN2=2,
                     momk=0):
 
     gaugeLinks = modelObj.linkHistory[gaugleLinkIndex]
 
-    if(modelObj.storedProps[gaugleLinkIndex] is None):
+    #if the object does NOT have stored props
+    #or if that stored prop just happens to be zero
+    if(hasattr(modelObj, "storedProps")):
+        if((modelObj.storedProps[gaugleLinkIndex] is None)):
 
-        #get total propagator
+            #get total propagator
+            dOp = ops.buildDiracOp(modelObj, gaugeLinks)
+            prop = np.linalg.inv(dOp.toarray())
+
+            modelObj.storedProps[gaugleLinkIndex] = prop
+        else:
+            prop = modelObj.storedProps[gaugleLinkIndex]
+    else:
         dOp = ops.buildDiracOp(modelObj, gaugeLinks)
         prop = np.linalg.inv(dOp.toarray())
 
-        modelObj.storedProps[gaugleLinkIndex] = prop
-    else:
-        prop = modelObj.storedProps[gaugleLinkIndex]
-
     #build the two smearing operators
-    S1 = ops.jacobiSmearingOp(modelObj, gaugeLinks, 
-                         kappa=kappa1,smearingSteps=smearN1)
-    S2 = ops.jacobiSmearingOp(modelObj, gaugeLinks, 
-                         kappa=kappa2,smearingSteps=smearN2)
+    S1 = smearingOp1
+    S2 = smearingOp2
     
     #in order to take into account smearing
     #we will have to asymetically smear the propagator
@@ -84,18 +88,20 @@ def correlStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
         weightsMu = np.repeat(weightsMu,2)
 
     for i in tqdm(range(burnIn,modelObj.metroSteps,autocorrSkip)):
-        Cconn = getCorrelation(modelObj, i,
-                               Gamma1=Gamma1, Gamma2=Gamma2,
-                                kappa1=kappa1, smearN1=smearN1, kappa2=kappa2, smearN2=smearN2,
-                                momk=momk)
+        jacobiS1 = ops.jacobiSmearingOp(modelObj, modelObj.linkHistory[i],kappa1,smearN1)
+        jacobiS2 = ops.jacobiSmearingOp(modelObj, modelObj.linkHistory[i],kappa2,smearN2)
+        Cconn = getCorrelation(modelObj, i, 
+                               smearingOp1=jacobiS1,
+                               smearingOp2=jacobiS2,
+                               Gamma1=Gamma1, Gamma2=Gamma2, momk=momk)
         
         acceptedCorrel_conn.append(Cconn)
 
         if(momk!=0):
-            Cconn = getCorrelation(modelObj, i,
-                                    Gamma1=Gamma1, Gamma2=Gamma2,
-                                    kappa1=kappa1, smearN1=smearN1, kappa2=kappa2, smearN2=smearN2,
-                                    momk=-momk)
+            Cconn = getCorrelation(modelObj, i, 
+                               smearingOp1=jacobiS1,
+                               smearingOp2=jacobiS2,
+                               Gamma1=Gamma1, Gamma2=Gamma2, momk=-momk)
         
             acceptedCorrel_conn.append(Cconn)
 
@@ -144,36 +150,27 @@ def GEVPStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
         weightsMu = np.repeat(weightsMu,2)
 
     for i in tqdm(range(burnIn,modelObj.metroSteps,autocorrSkip)):
-        cSame1 = getCorrelation(modelObj, i,
-                               Gamma1=Gamma, Gamma2=Gamma,
-                                kappa1=kappa1, smearN1=smearN1, kappa2=kappa1, smearN2=smearN1,
-                                momk=momk)
-        cSame2 = getCorrelation(modelObj, i,
-                               Gamma1=Gamma, Gamma2=Gamma,
-                                kappa1=kappa2, smearN1=smearN2, kappa2=kappa2, smearN2=smearN2,
-                                momk=momk)
-        cMixed = getCorrelation(modelObj, i,
-                               Gamma1=Gamma, Gamma2=Gamma,
-                                kappa1=kappa1, smearN1=smearN1, kappa2=kappa2, smearN2=smearN2,
-                                momk=momk)
+        jacobiS1 = ops.jacobiSmearingOp(modelObj, modelObj.linkHistory[i],kappa1,smearN1)
+        jacobiS2 = ops.jacobiSmearingOp(modelObj, modelObj.linkHistory[i],kappa2,smearN2)
+
+        cSame1 = getCorrelation(modelObj, i, jacobiS1, jacobiS1,
+                               Gamma1=Gamma, Gamma2=Gamma, momk=momk)
+        cSame2 = getCorrelation(modelObj, i, jacobiS2, jacobiS2,
+                               Gamma1=Gamma, Gamma2=Gamma, momk=momk)
+        cMixed = getCorrelation(modelObj, i,jacobiS1, jacobiS2,
+                               Gamma1=Gamma, Gamma2=Gamma, momk=momk)
         
         acceptedCSame1.append(cSame1)
         acceptedCSame2.append(cSame2)
         acceptedCMixed.append(cMixed)
 
         if(momk!=0):
-            cSame1 = getCorrelation(modelObj, i,
-                                Gamma1=Gamma, Gamma2=Gamma,
-                                    kappa1=kappa1, smearN1=smearN1, kappa2=kappa1, smearN2=smearN1,
-                                    momk=-momk)
-            cSame2 = getCorrelation(modelObj, i,
-                                Gamma1=Gamma, Gamma2=Gamma,
-                                    kappa1=kappa2, smearN1=smearN2, kappa2=kappa2, smearN2=smearN2,
-                                    momk=-momk)
-            cMixed = getCorrelation(modelObj, i,
-                                Gamma1=Gamma, Gamma2=Gamma,
-                                    kappa1=kappa1, smearN1=smearN1, kappa2=kappa2, smearN2=smearN2,
-                                    momk=-momk)
+            cSame1 = getCorrelation(modelObj, i, jacobiS1, jacobiS1,
+                                Gamma1=Gamma, Gamma2=Gamma, momk=-momk)
+            cSame2 = getCorrelation(modelObj, i, jacobiS2, jacobiS2,
+                                Gamma1=Gamma, Gamma2=Gamma, momk=-momk)
+            cMixed = getCorrelation(modelObj, i,jacobiS1, jacobiS2,
+                                Gamma1=Gamma, Gamma2=Gamma, momk=-momk)
             
             acceptedCSame1.append(cSame1)
             acceptedCSame2.append(cSame2)
@@ -190,7 +187,7 @@ def GEVPStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
     totalCorrels = np.zeros((len(acceptedCSame1),len(acceptedCSame1[0])-ti))
     for i in range(len(acceptedCSame1)):
         newCorrs, basis = gevp(acceptedCSame1[i],acceptedCSame2[i],acceptedCMixed[i],ti=ti)
-        totalCorrels[i] = newCorrs[:,0]
+        totalCorrels[i] = np.real(newCorrs[:,0])
 
     #bootstrapping
     numResamples = 10000
