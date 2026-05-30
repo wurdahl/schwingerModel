@@ -198,7 +198,30 @@ def effectiveMassStats(modelObj,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0
 
     return [effectiveMassMean, np.array([high-effectiveMassMean, effectiveMassMean-low])]
 
-def effectiveMassProp(correlStats, coshExpr=False):    
+def effectiveMassProp(correlStats, coshExpr=False):
+    """Compute the effective mass and its error via naive error propagation.
+
+    Parameters
+    ----------
+    correlStats : list
+        Output of ``correlStats``: ``[mean, errors]`` where ``mean`` is a
+        ``(dimt,)`` correlator array and ``errors`` is a ``(2, dimt)``
+        array of ``[upper, lower]`` 95% CI half-widths.
+    coshExpr : bool, optional
+        If False (default), use the log-ratio ``m_eff(t) = log(C(t)/C(t+1))``,
+        returning length ``dimt-1``. If True, use the symmetric cosh definition
+        ``m_eff(t) = arccosh((C(t-1)+C(t+1)) / (2C(t)))``, returning length
+        ``dimt-2``.
+
+    Returns
+    -------
+    effectiveMass : ndarray
+        Effective mass at each time slice.
+    effectiveMassErr : ndarray
+        Propagated uncertainty, assuming correlator values at adjacent time
+        slices are uncorrelated. For a more robust estimate use
+        ``effectiveMassStats``, which bootstraps the effective mass directly.
+    """
     #extract Correlation function
     cFunc = correlStats[0]
     cFuncErr = np.mean(correlStats[1],axis=0)
