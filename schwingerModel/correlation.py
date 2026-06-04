@@ -136,7 +136,7 @@ def correlStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
 def GEVPStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
                     Gamma=np.array([[1j,0],[0,-1j]]),
                     kappa1=.1, smearN1=1, kappa2=0, smearN2=0,
-                    momk=0, ti=1):
+                    momk=0, ti=1, hiMass=False):
     
     acceptedCSame1 = []
     acceptedCSame2 = []
@@ -187,13 +187,18 @@ def GEVPStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
     totalCorrels = np.zeros((len(acceptedCSame1),len(acceptedCSame1[0])-ti))
     for i in range(len(acceptedCSame1)):
         newCorrs, basis = gevp(acceptedCSame1[i],acceptedCSame2[i],acceptedCMixed[i],ti=ti)
-        totalCorrels[i] = np.real(newCorrs[:,0])
+
+        if(hiMass):
+            totalCorrels[i] = np.real(newCorrs[:,1])
+        else:
+            totalCorrels[i] = np.real(newCorrs[:,0])
 
     #bootstrapping
     numResamples = 10000
     rng = np.random.default_rng()
 
     resamples = rng.choice(len(totalCorrels), size=(numResamples, len(totalCorrels)))
+    resamplesHiMass = rng.choice(len(totalCorrels), size=(numResamples, len(totalCorrels)))
 
     # (numResamples, n_configs, dimt) and (numResamples, n_configs)
     correl_boot = totalCorrels[resamples]
@@ -205,8 +210,8 @@ def GEVPStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
         np.sum(w_boot, axis=1, keepdims=True)
     )
     #calculate covariance matrix to allow for fitting
-    allcovs = np.array([np.cov(correl_boot[i],rowvar=False) for i in range(len(correl_boot))])
-    covMat = np.mean(allcovs, axis=0)
+
+    covMat = np.cov(bootstrap_means, rowvar=False)
 
     low  = np.percentile(bootstrap_means, 2.5,  axis=0)
     high = np.percentile(bootstrap_means, 97.5, axis=0)
@@ -219,19 +224,29 @@ def GEVPStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
 def gevp(corr1, corr2, corrMixed, ti=1):
     correlMat = np.stack([[corr1,corrMixed],[corrMixed,corr2]])
 
-    #this is assuming the the eigenvalues will be sorted in the propoer way
+    #this is assuming the the eigenvalues will be sorted in the proper way
     gevpOutput = [eig(a=correlMat[:,:,i],b=correlMat[:,:,ti]) for i in range(ti, len(corr1))]
 
-    newCorr = np.array([gevpOutput[i][0] for i in range(len(gevpOutput))])
+    #sort gevpOutput by magnitude of real part of eigenvalues
+    
+    newCorr = np.array([np.sort(np.real(gevpOutput[i][0]))[::-1] for i in range(len(gevpOutput))])
     basis = np.mean(np.array([gevpOutput[i][0] for i in range(len(gevpOutput))]),axis=0)
 
     return newCorr, basis
 
-def gevpMassExtract(gevpStatsOut,fitT=10):
+def gevpMassExtract(gevpStatsOut,fitT=10,dimt=32,ti=1,coshExpr=True):
     def expDecay(nt, Energy):
         return np.exp(-nt*Energy)
+    
+    def coshCorrel(nt, Energy):
+        return (np.exp(-(nt+ti)*Energy)+np.exp(((nt+ti)-dimt)*Energy))/(np.exp(-(ti)*Energy)+np.exp(((ti)-dimt)*Energy))
 
-    fitMass = curve_fit(expDecay, xdata=np.arange(fitT), 
+
+    if(coshExpr):
+        fitMass = curve_fit(coshCorrel, xdata=np.arange(fitT), 
+                    ydata=gevpStatsOut[0][:fitT],sigma=gevpStatsOut[2][:fitT,:fitT],absolute_sigma=True)
+    else:
+        fitMass = curve_fit(expDecay, xdata=np.arange(fitT), 
                     ydata=gevpStatsOut[0][:fitT],sigma=gevpStatsOut[2][:fitT,:fitT],absolute_sigma=True)
     
-    return np.array([fitMass[0][0], fitMass[1][0,0]])
+    return np.array([fitMass[0][0], np.sqrt(fitMass[1][0,0])])
