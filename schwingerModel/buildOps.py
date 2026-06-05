@@ -1,10 +1,15 @@
+from __future__ import annotations
+
 import numpy as np
 import scipy.sparse as sparse
 from scipy.stats import bootstrap
 from scipy.optimize import curve_fit
 from tqdm import tqdm
 
-from .schwingerModel import schwingerModel
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .schwingerModel import schwingerModel
 
 #builds the dirac operator using the global gaugeLinks configuration
 # matrix is a square matrix with dimensional ordering (space, time, spin) 
@@ -31,8 +36,8 @@ def buildDiracOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
     T_t_neg = sparse.kron(space_identity, shift_t_1Dneg)
 
     #flattened gaugelinks
-    spaceLinks = np.diag(gaugeLinks[:,:,1].flatten())
-    timeLinks = np.diag(gaugeLinks[:,:,0].flatten())
+    spaceLinks = sparse.diags_array(gaugeLinks[:,:,1].flatten())
+    timeLinks = sparse.diags_array(gaugeLinks[:,:,0].flatten())
 
     #start building dirac operator matrix
     Dee = (modelObj.fMass+2/modelObj.a)*sparse.kron(space_identity, sparse.kron(time_identity,eyeD))

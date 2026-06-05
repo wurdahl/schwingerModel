@@ -7,6 +7,7 @@ from scipy.stats import bootstrap
 from scipy.optimize import curve_fit
 from tqdm import tqdm
 
+from . import buildOps as ops
 
 class schwingerModel:
 
@@ -37,71 +38,13 @@ class schwingerModel:
         self.previous_CG_ans = None
 
         self.hmcChain()
-
-    def apply_D_vectorized(self, vector=np.full(4*4*2,1+0j), gaugeLinks=np.full((4,4,2),1+0j),dagger=False):
-        phi = np.reshape(vector, (self.dimx, self.dimt, 2))
-        out = np.zeros_like(phi, dtype=np.complex128)
-        
-        # 1. Mass term
-        out += (self.fMass + 2/self.a) * phi
-        
-        # 2. Shift fields (periodic boundaries handled automatically by np.roll)
-        phi_xp1 = np.roll(phi, shift=-1, axis=0)
-        phi_xm1 = np.roll(phi, shift=1, axis=0)
-        phi_tp1 = np.roll(phi, shift=-1, axis=1)
-        phi_tm1 = np.roll(phi, shift=1, axis=1)
-        
-        # Shift gauge links for backward directions
-        U_x_xm1 = np.roll(gaugeLinks[:, :, 1], shift=1, axis=0)
-        U_t_tm1 = np.roll(gaugeLinks[:, :, 0], shift=1, axis=1)
-        
-        # 3. Time Boundary Conditions (Anti-periodic for fermions)
-        bc_fw_t = np.ones((self.dimx, self.dimt, 1))
-        bc_fw_t[:, -1, :] = -1.0
-        
-        bc_bw_t = np.ones((self.dimx, self.dimt, 1))
-        bc_bw_t[:, 0, :] = -1.0
-        
-        # 4. Spinor Matrices
-        I = np.eye(2)
-        P_plus_x = I + self.gammax
-        P_minus_x = I - self.gammax
-        P_plus_t = I + self.gammat
-        P_minus_t = I - self.gammat
-        
-        # 5. Kinetic Terms
-        # np.einsum('ij,xyj->xyi', Matrix, Field) applies the 2x2 matrix to the spinor at every site x,y
-        if(dagger==False):
-            # +x direction
-            term_xp1 = np.einsum('ij,xyj->xyi', P_minus_x, phi_xp1) * gaugeLinks[:, :, 1, np.newaxis]
-            # -x direction
-            term_xm1 = np.einsum('ij,xyj->xyi', P_plus_x, phi_xm1) * np.conjugate(U_x_xm1[:, :, np.newaxis])
-            # +t direction
-            term_tp1 = np.einsum('ij,xyj->xyi', P_minus_t, phi_tp1) * gaugeLinks[:, :, 0, np.newaxis] * bc_fw_t
-            # -t direction
-            term_tm1 = np.einsum('ij,xyj->xyi', P_plus_t, phi_tm1) * np.conjugate(U_t_tm1[:, :, np.newaxis]) * bc_bw_t
-            
-        else: #hermitian conjugate
-             # +x direction
-            term_xp1 = np.einsum('ij,xyj->xyi', P_plus_x, phi_xp1) * gaugeLinks[:, :, 1, np.newaxis]
-            # -x direction
-            term_xm1 = np.einsum('ij,xyj->xyi', P_minus_x, phi_xm1) * np.conjugate(U_x_xm1[:, :, np.newaxis])
-            # +t direction
-            term_tp1 = np.einsum('ij,xyj->xyi', P_plus_t, phi_tp1) * gaugeLinks[:, :, 0, np.newaxis] * bc_fw_t
-            # -t direction
-            term_tm1 = np.einsum('ij,xyj->xyi', P_minus_t, phi_tm1) * np.conjugate(U_t_tm1[:, :, np.newaxis]) * bc_bw_t
-
-        out -= (1/(2*self.a)) * (term_xp1 + term_xm1 + term_tp1 + term_tm1)
-        return out.flatten()
-
-    def apply_D_Ddagger(self,vector=np.full(4*4*2,1+0j),gaugeLinks = np.full((4,4,2),1+0j)):
-        return self.apply_D_vectorized(self.apply_D_vectorized(vector,gaugeLinks, dagger=True),gaugeLinks)
     
 
     def pseudoBilinear(self, pseudoField = np.full(4*4*2,1+0j), gaugeLinks = np.full((4,4,2),1+0j)):
-        matvec_wrapper = lambda v: self.apply_D_Ddagger(v, gaugeLinks)
+        # matvec_wrapper = lambda v: self.apply_D_Ddagger(v, gaugeLinks)
 
-        diracOp = LinearOperator((self.dimx*self.dimt*2,self.dimx*self.dimt*2), matvec = matvec_wrapper)
+        # diracOp = LinearOperator((self.dimx*self.dimt*2,self.dimx*self.dimt*2), matvec = matvec_wrapper)
+        diracOp = ops.buildDiracOp(self,gaugeLinks)
 
         X, exitcode = bicgstab(diracOp,pseudoField,rtol=self.cgRtol)
 
@@ -162,13 +105,12 @@ class schwingerModel:
         #gauge field contribution
 
         #calculate cg for fermion force calculation
-        matvec_wrapper = lambda v: self.apply_D_Ddagger(v, gaugeLinks)
-
-        diracOp = LinearOperator((self.dimx*self.dimt*2,self.dimx*self.dimt*2), matvec = matvec_wrapper)
+        diracOp = ops.buildDiracOp(self, gaugeLinks)
+        dDag = diracOp.conj().T
 
         #X is (D D^\dagger)\phi
         x0 = self.previous_CG_ans if self.previous_CG_ans is not None else np.zeros_like(phis)
-        X, exitcode = cg(diracOp, phis, x0=x0, rtol=self.cgRtol)
+        X, exitcode = cg(diracOp@dDag, phis, x0=x0, rtol=self.cgRtol)
         #save X to use on next iteration
         self.previous_CG_ans = X
 
@@ -176,7 +118,7 @@ class schwingerModel:
             raise RuntimeError(f"Conjugate Gradient failed to converge! Exit code: {exitcode}")
         
         #Y = D^\dagger X
-        Y = self.apply_D_vectorized(X, gaugeLinks,dagger=True)
+        Y = (dDag)@X
 
         Y = np.reshape(Y,(self.dimx,self.dimt,2))
         X = np.reshape(X,(self.dimx,self.dimt,2))
@@ -216,17 +158,24 @@ class schwingerModel:
         Force = np.zeros((self.dimx, self.dimt, 2))
 
         # --- CG solve (same as original) ---
-        matvec_wrapper = lambda v: self.apply_D_Ddagger(v, gaugeLinks)
-        diracOp = LinearOperator((self.dimx*self.dimt*2, self.dimx*self.dimt*2), matvec=matvec_wrapper)
+        diracOp = ops.buildDiracOp(self, gaugeLinks)
+        dDag = diracOp.conj().T
+
+        #X is (D D^\dagger)\phi
         x0 = self.previous_CG_ans if self.previous_CG_ans is not None else np.zeros_like(phis)
-        X, exitcode = cg(diracOp, phis, x0=x0, rtol=self.cgRtol)
+        X, exitcode = cg(diracOp@dDag, phis, x0=x0, rtol=self.cgRtol)
+        #save X to use on next iteration
         self.previous_CG_ans = X
+
         if exitcode != 0:
             raise RuntimeError(f"Conjugate Gradient failed to converge! Exit code: {exitcode}")
+        
+        #Y = D^\dagger X
+        # Y = self.apply_D_vectorized(X, gaugeLinks,dagger=True)
+        Y = (dDag)@X
 
-        Y = self.apply_D_vectorized(X, gaugeLinks, dagger=True)
-        Y = np.reshape(Y, (self.dimx, self.dimt, 2))
-        X = np.reshape(X, (self.dimx, self.dimt, 2))
+        Y = np.reshape(Y,(self.dimx,self.dimt,2))
+        X = np.reshape(X,(self.dimx,self.dimt,2))
 
         I = np.eye(2, dtype=np.complex128)
         c = 1j / (2 * self.a)
@@ -303,7 +252,8 @@ class schwingerModel:
         #generate pseduofermions field:
         chi = self.rng.normal(loc=0,scale=1/np.sqrt(2),size=(self.dimx*self.dimt*2))+1j*self.rng.normal(loc=0,scale=1/np.sqrt(2),size=(self.dimx*self.dimt*2))
 
-        phi = self.apply_D_vectorized(chi,self.gaugeLinks)
+        # phi = self.apply_D_vectorized(chi,self.gaugeLinks)
+        phi = ops.buildDiracOp(self,self.gaugeLinks)@chi
 
         #generate initial value for conjugate field
         conjPInitial = self.rng.normal(loc=0,scale=1,size=(self.dimx,self.dimt,2))
