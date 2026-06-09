@@ -1,5 +1,6 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "python.defaultInterpreterPath": "/home/wurdahl/miniconda3/envs/science/bin/python"
+    "python.defaultInterpreterPath": "/home/wurdahl/miniconda3/envs/science/bin/python",
+    "python.interpreter.uri": "file:///home/wurdahl/miniconda3/envs/science/bin/python"
 }

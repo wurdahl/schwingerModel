@@ -50,6 +50,7 @@ def buildDiracOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
 
     return Dee
 
+
 def buildNumberDensOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
     #dirac dimensions
     dimD = 2
@@ -98,16 +99,30 @@ def jacobiSmearingH(modelObj: schwingerModel, gaugeLinks):
 
     return H
 
+
+def applyJacobi(H, kappa, smearN, v):
+    """Apply S = sum_{n=0}^{smearN} kappa^n H^n to v, shape (N,) or (N,k)."""
+    out = np.array(v, dtype=complex)
+    Hn_v = np.array(v, dtype=complex)
+    for n in range(1, smearN + 1):
+        Hn_v = H @ Hn_v
+        out += kappa**n * Hn_v
+    return out
+
 def jacobiSmearingOp(modelObj: schwingerModel, gaugeLinks, kappa = .1, smearingSteps=1):
 
-    jacobiH = jacobiSmearingH(modelObj, gaugeLinks)
+    jacobiH = jacobiSmearingH(modelObj, gaugeLinks).tocsc()
 
-    jacobiM = np.identity(jacobiH.shape[0], dtype=np.complex128)
+    N = jacobiH.shape[0]
+    jacobiM = np.identity(N, dtype=np.complex128)
 
     if(smearingSteps>0):
+        Hn = jacobiH.toarray()
         for n in range(1, smearingSteps+1):
-            jacobiM += kappa**n * np.linalg.matrix_power(jacobiH.toarray(),n)
-    
+            jacobiM += kappa**n * Hn
+            if n < smearingSteps:
+                Hn = Hn @ jacobiH
+
     return jacobiM
 
 def smearedPropagator(modelObj: schwingerModel, gaugeLinks, kappa=.1, smearingSteps=1, chemicalPot=0):
