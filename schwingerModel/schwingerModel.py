@@ -11,7 +11,7 @@ from . import buildOps as ops
 
 class schwingerModel:
 
-    def __init__(self, dimx = 4, dimt=4, metroSteps = 100, beta = 10, fMass = 1, aSpacing=1,cgRtol = 1e-10, randSeed=0):
+    def __init__(self, dimx = 4, dimt=4, metroSteps = 100, beta = 10, fMass = 1, aSpacing=1,cgRtol = 1e-10, randSeed=0, tqdmPosition=0):
 
         #define gamma matrices
         self.gammax = np.array([[0,1],[1,0]])
@@ -36,6 +36,7 @@ class schwingerModel:
 
         #used to store conjugate gradient answers during one trajectory
         self.previous_CG_ans = None
+        self.tqdmPosition = tqdmPosition
 
         self.hmcChain()
     
@@ -281,20 +282,7 @@ class schwingerModel:
         return success
     
     def hmcChain(self):
-        currentStep = 0
-        for currentStep in tqdm(range(self.metroSteps)):
+        for currentStep in tqdm(range(self.metroSteps), position=self.tqdmPosition, leave=True):
             self.hmcStep()
             self.linkHistory[currentStep] = self.gaugeLinks
 
-
-
-    
-    
-    
-    
-   
-    
-    
-   
-    
-    

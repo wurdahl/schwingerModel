@@ -271,16 +271,15 @@ def numDensityStats(modelObj, burnIn, autocorrSkip=1, chemicalPot=0.0):
     for i in tqdm(range(burnIn, modelObj.metroSteps, autocorrSkip)):
         links = modelObj.linkHistory[i]
 
-        #build dirac props
-        S_mu = np.linalg.inv(ops.buildDiracOp(modelObj, links, chemicalPot).toarray())
-        S_0  = np.linalg.inv(ops.buildDiracOp(modelObj, links, 0.0).toarray())
+        D_mu = np.linalg.inv(ops.buildDiracOp(modelObj, links, chemicalPot).toarray())
+        D_0  = np.linalg.inv(ops.buildDiracOp(modelObj, links, 0.0).toarray())
 
-        #build number density operators
-        n_mu = ops.buildNumberDensOp(modelObj, links, chemicalPot).toarray()
-        n_0 = ops.buildNumberDensOp(modelObj, links, 0.0).toarray()
+        # keep n sparse: Tr(S·n) = n.multiply(S.T).sum() is O(nnz) not O(N³)
+        n_mu = ops.buildNumberDensOp(modelObj, links, chemicalPot)
+        n_0  = ops.buildNumberDensOp(modelObj, links, 0.0)
 
-        n_mu_samples.append(np.trace(S_mu@n_mu)/V)
-        n_0_samples.append(np.trace(S_0@n_0)/V)
+        n_mu_samples.append(n_mu.multiply(D_mu.T).sum() / V)
+        n_0_samples.append(n_0.multiply(D_0.T).sum() / V)
 
     n_mu_samples = np.array(n_mu_samples)
     n_0_samples  = np.array(n_0_samples)

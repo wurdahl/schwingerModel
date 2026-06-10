@@ -20,10 +20,10 @@ def buildDiracOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
 
     shift_x_1Dpos = np.roll(np.eye(modelObj.dimx), -1, axis=0) # This is \delta_{x_n+1, x_m}
     shift_t_1Dpos = np.roll(np.eye(modelObj.dimt), -1, axis=0)
-    shift_x_1Dneg = np.roll(np.eye(modelObj.dimx), +1, axis=0) # This is \delta_{x_n+1, x_m}
+    shift_x_1Dneg = np.roll(np.eye(modelObj.dimx), +1, axis=0) # This is \delta_{x_n-1, x_m}
     shift_t_1Dneg = np.roll(np.eye(modelObj.dimt), +1, axis=0)
-    time_identity = np.eye(modelObj.dimt)                      # This is \delta_{t_n, t_m}
-    space_identity = np.eye(modelObj.dimx)
+    time_identity = sparse.eye_array(modelObj.dimt)                      # This is \delta_{t_n, t_m}
+    space_identity = sparse.eye_array(modelObj.dimx)
 
     #anti-periodic boundary conditions for fermions in time
     shift_t_1Dpos[modelObj.dimt - 1, 0] = -1.0
@@ -45,8 +45,8 @@ def buildDiracOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
     Dee-=1/(2*modelObj.a) * sparse.kron(spaceLinks@T_x_pos, eyeD-modelObj.gammax)
     Dee-=1/(2*modelObj.a) * sparse.kron(timeLinks@T_t_pos, eyeD-modelObj.gammat)*np.exp(modelObj.a*chemicalPot)
     #negative shifts
-    Dee-=1/(2*modelObj.a) * sparse.kron(T_x_neg@np.conj(spaceLinks),eyeD+modelObj.gammax)
-    Dee-=1/(2*modelObj.a) * sparse.kron(T_t_neg@np.conj(timeLinks),eyeD+modelObj.gammat)*np.exp(-modelObj.a*chemicalPot)
+    Dee-=1/(2*modelObj.a) * sparse.kron(T_x_neg@(spaceLinks.conj()),eyeD+modelObj.gammax)
+    Dee-=1/(2*modelObj.a) * sparse.kron(T_t_neg@(timeLinks.conj()),eyeD+modelObj.gammat)*np.exp(-modelObj.a*chemicalPot)
 
     return Dee
 
@@ -58,7 +58,7 @@ def buildNumberDensOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
 
     shift_t_1Dpos = np.roll(np.eye(modelObj.dimt), -1, axis=0)
     shift_t_1Dneg = np.roll(np.eye(modelObj.dimt), +1, axis=0)
-    space_identity = np.eye(modelObj.dimx)
+    space_identity = sparse.eye_array(modelObj.dimx)
 
     #anti-periodic boundary conditions for fermions in time
     shift_t_1Dpos[modelObj.dimt - 1, 0] = -1.0
@@ -70,7 +70,7 @@ def buildNumberDensOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
     T_t_neg = sparse.kron(space_identity, shift_t_1Dneg)
 
     #flattened gaugelinks
-    timeLinks = np.diag(gaugeLinks[:,:,0].flatten())
+    timeLinks = sparse.diags_array(gaugeLinks[:,:,0].flatten())
 
     nOp=-1/(2) * sparse.kron(timeLinks@T_t_pos, eyeD-modelObj.gammat)*np.exp(modelObj.a*chemicalPot)
     #negative shifts
