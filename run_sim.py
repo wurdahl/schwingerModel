@@ -3,23 +3,26 @@ from joblib import Parallel, delayed
 import pickle
 import schwingerModel as sim
 
-m = 0.1
+m = 0.2
 a = 1
-dimx = 8 
-dimt = 16
-beta = 1
+dimx = 32
+dimt = 64
+beta = 10
 
-targetConfigs = 100000
+targetConfigs = 50000
 burnIn = 500
 nThreads = 16
 stepsPerChain = targetConfigs // nThreads
+
+subSteps = 50
 
 def run_chain(seed):
     model = sim.schwingerModel(
         metroSteps=burnIn + stepsPerChain,
         beta=beta, dimx=dimx, dimt=dimt,
         aSpacing=a, fMass=m, cgRtol=1e-5,
-        randSeed=seed, tqdmPosition=seed
+        randSeed=seed, tqdmPosition=seed,
+        numSubSteps=subSteps
     )
     return model if seed == 0 else model.linkHistory[burnIn:]
 
@@ -32,5 +35,5 @@ if __name__ == '__main__':
     base.metroSteps = targetConfigs
     base.storedProps = [None] * targetConfigs
 
-    with open('configs/50kSteps_strongCoupling.pkl', 'wb') as f:
+    with open('configs/50kSteps_scale_2.pkl', 'wb') as f:
         pickle.dump(base, f)

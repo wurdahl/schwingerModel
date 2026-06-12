@@ -11,7 +11,8 @@ from . import buildOps as ops
 
 class schwingerModel:
 
-    def __init__(self, dimx = 4, dimt=4, metroSteps = 100, beta = 10, fMass = 1, aSpacing=1,cgRtol = 1e-10, randSeed=0, tqdmPosition=0):
+    def __init__(self, dimx = 4, dimt=4, metroSteps = 100, beta = 10, fMass = 1,
+                  aSpacing=1,cgRtol = 1e-10, numSubSteps=100, randSeed=0, tqdmPosition=0):
 
         #define gamma matrices
         self.gammax = np.array([[0,1],[1,0]])
@@ -27,6 +28,7 @@ class schwingerModel:
         self.fMass = fMass
         self.a = aSpacing
         self.cgRtol = cgRtol
+        self.numSubSteps = numSubSteps
         
         self.gaugeLinks = np.full((dimx,dimt,2),1+0j)
 
@@ -42,12 +44,10 @@ class schwingerModel:
     
 
     def pseudoBilinear(self, pseudoField = np.full(4*4*2,1+0j), gaugeLinks = np.full((4,4,2),1+0j)):
-        # matvec_wrapper = lambda v: self.apply_D_Ddagger(v, gaugeLinks)
-
-        # diracOp = LinearOperator((self.dimx*self.dimt*2,self.dimx*self.dimt*2), matvec = matvec_wrapper)
         diracOp = ops.buildDiracOp(self,gaugeLinks)
+        dDag = diracOp.conj().T
 
-        X, exitcode = bicgstab(diracOp,pseudoField,rtol=self.cgRtol)
+        X, exitcode = cg(diracOp @ dDag, pseudoField, rtol=self.cgRtol)
 
         if exitcode != 0:
             raise RuntimeError(f"Conjugate Gradient failed to converge! Exit code: {exitcode}")
@@ -109,7 +109,7 @@ class schwingerModel:
         diracOp = ops.buildDiracOp(self, gaugeLinks)
         dDag = diracOp.conj().T
 
-        #X is (D D^\dagger)\phi
+        #X is (D D^\dagger)^{-1}\phi
         x0 = self.previous_CG_ans if self.previous_CG_ans is not None else np.zeros_like(phis)
         X, exitcode = cg(diracOp@dDag, phis, x0=x0, rtol=self.cgRtol)
         #save X to use on next iteration
@@ -140,12 +140,12 @@ class schwingerModel:
                 tp1 = (t + 1) % self.dimt
 
                 #spatial direction
-                Z = (np.vdot(X[x,t], -c*(I-self.gammax)*gaugeLinks[x,t,1] @ Y[xp1,t]) 
+                Z = (np.vdot(X[x,t], -c*(I-self.gammax)*gaugeLinks[x,t,1] @ Y[xp1,t])
                                 + np.vdot(X[xp1,t], c*(I+self.gammax)*np.conjugate(gaugeLinks[x,t,1]) @ Y[x,t]))
-                Force[x,t,1] -=2*Z.real 
-                
+                Force[x,t,1] -=2*Z.real
+
                 #time direction
-                Z = (np.vdot(X[x,t], -c*(I-self.gammat)*gaugeLinks[x,t,0] @ Y[x,tp1]) 
+                Z = (np.vdot(X[x,t], -c*(I-self.gammat)*gaugeLinks[x,t,0] @ Y[x,tp1])
                                 + np.vdot(X[x,tp1],c*(I+self.gammat)*np.conjugate(gaugeLinks[x,t,0]) @ Y[x,t]))
                 
                 #enforce antiperiodic boundary condition
@@ -283,6 +283,6 @@ class schwingerModel:
     
     def hmcChain(self):
         for currentStep in tqdm(range(self.metroSteps), position=self.tqdmPosition, leave=True):
-            self.hmcStep()
+            self.hmcStep(numSubSteps=self.numSubSteps)
             self.linkHistory[currentStep] = self.gaugeLinks
 

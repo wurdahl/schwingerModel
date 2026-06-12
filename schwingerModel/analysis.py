@@ -377,6 +377,14 @@ def getCorrelation(modelObj,gaugeLinks,Gamma=np.array([[1j,0],[0,-1j]]), k=0, sm
     #return both connected and disconnected part
     return np.real(correl_conn), correl_disc, trace_source_avg
 
+def acceptanceFraction(modelObj: schwingerModel):
+    history = modelObj.linkHistory
+    accepted = np.array([
+        not np.array_equal(history[i], history[i - 1])
+        for i in range(1, len(history))
+    ])
+    return accepted.mean()
+
 def getWeightingFactors(modelObj: schwingerModel, chemicalPot= 1,burnIn=1, autocorrSkip=10):
     #loop through gaugeLinks of the modelObj and get the weightings:
 
