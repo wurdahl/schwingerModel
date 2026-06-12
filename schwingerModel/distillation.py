@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from .schwingerModel import schwingerModel
 
 from .buildOps import buildDiracOp
+from .analysis import getWeightingFactorsTheta
 
 def buildLaplacian(modelObj: schwingerModel, gaugeLinks, nt):
     """
@@ -114,19 +115,20 @@ def getCorrelation(modelObj: schwingerModel, configIndex: int, numVecs: int, che
     correlator = np.array([
         np.roll(trace, -dt, axis=0).diagonal().mean()
         for dt in range(modelObj.dimt)
-    ]).real
+    ])
 
     return correlator
 
 def correlStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
-                    Gamma=np.array([[1j,0],[0,-1j]]), nVec=2):
+                    Gamma=np.array([[1j,0],[0,-1j]]), nVec=2, chemicalPot=0, theta=0):
     
-       
+    weights = getWeightingFactorsTheta(modelObj, theta=theta,burnIn=burnIn, autocorrSkip=autocorrSkip)
+    
     indices = np.arange(burnIn, modelObj.metroSteps, autocorrSkip)
     with tqdm_joblib(tqdm(total=len(indices), desc="configs")):
-        correl = np.array(Parallel(n_jobs=-1)(delayed(getCorrelation)(modelObj, i, nVec, gamma=Gamma) for i in indices))
+        correl = np.array(Parallel(n_jobs=-1)(delayed(getCorrelation)(modelObj, i, nVec, gamma=Gamma,chemicalPot=chemicalPot) for i in indices))
 
-    totalCorrelMean = np.real(np.average(correl,axis=0))
+    totalCorrelMean = np.real(np.average(correl,axis=0,weights=weights))
 
     #bootstrapping
     numResamples = 10000
@@ -136,18 +138,20 @@ def correlStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
 
     # (numResamples, n_configs, dimt)
     correl_boot = correl[resamples]
+    w_boot = weights[resamples]
 
     # weighted mean for each bootstrap sample -> (numResamples, dimt)
     bootstrap_means = np.real(
-        np.mean(correl_boot, axis=1)
+        np.sum(correl_boot * w_boot[:, :, np.newaxis], axis=1) /
+        np.sum(w_boot, axis=1, keepdims=True)
     )
 
     low  = np.percentile(bootstrap_means, 2.5,  axis=0)
     high = np.percentile(bootstrap_means, 97.5, axis=0)
 
-    covMat = np.cov(bootstrap_means,rowvar=False)
+    covMat = np.real(np.cov(bootstrap_means,rowvar=False))
 
-    return [totalCorrelMean, np.array([high-totalCorrelMean, totalCorrelMean-low]), covMat]
+    return [totalCorrelMean, np.array([high-totalCorrelMean, totalCorrelMean-low]).real, covMat]
 
 
 def correlMassExtract(correlStatsOut, fitT=[1,10],diagCov=False):

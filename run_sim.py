@@ -3,15 +3,15 @@ from joblib import Parallel, delayed
 import pickle
 import schwingerModel as sim
 
-m = .2
-a = .25
-dimx = round(16/a)  # divide by a in order to get the same volume
-dimt = round(32/a)
-beta = 10/a**2      # divide by a**2 in order to get the correct cont limit i.e. same charge
+m = 0.1
+a = 1
+dimx = 8 
+dimt = 16
+beta = 1
 
-targetConfigs = 10000
+targetConfigs = 100000
 burnIn = 500
-nThreads = 8
+nThreads = 16
 stepsPerChain = targetConfigs // nThreads
 
 def run_chain(seed):
@@ -32,5 +32,5 @@ if __name__ == '__main__':
     base.metroSteps = targetConfigs
     base.storedProps = [None] * targetConfigs
 
-    with open('configs/10kSteps_a_0.25.pkl', 'wb') as f:
+    with open('configs/50kSteps_strongCoupling.pkl', 'wb') as f:
         pickle.dump(base, f)
