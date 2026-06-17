@@ -52,7 +52,7 @@ def buildLaplacian(modelObj: schwingerModel, gaugeLinks, nt):
 
     return H
 
-def findPartialEigenBasis(modelObj: schwingerModel, configIndex = 0, numVecs = 4, momk=0):
+def findPartialEigenBasis(modelObj: schwingerModel, configIndex = 0, numVecs = 4):
 
     eigenBases = []
 
@@ -78,7 +78,12 @@ def buildPerambulator(modelObj: schwingerModel, configIndex: int, numVecs: int, 
         = sum_x V(t_sink)[x,l]* M^{-1}[x,t_sink,s_sink; x',t_src,s_src] V(t_src)[x',k]
     """
     gaugeLinks = modelObj.linkHistory[configIndex]
-    eigVecs = findPartialEigenBasis(modelObj, configIndex, numVecs, momk=momk)
+    eigVecs = findPartialEigenBasis(modelObj, configIndex, numVecs)
+
+    #do momentum projection to partial eigenbasis
+    momPhases = np.exp(-1j*2*np.pi*momk*np.arange(modelObj.dimx)/modelObj.dimx)
+    eigVecs = eigVecs * momPhases[np.newaxis,:,np.newaxis]
+
     # eigVecs shape: (dimt, dimx, numVecs)
 
     N_t, N_x, N_vec = eigVecs.shape
@@ -104,9 +109,9 @@ def buildPerambulator(modelObj: schwingerModel, configIndex: int, numVecs: int, 
     return tau
 
 def getCorrelation(modelObj: schwingerModel, configIndex: int, numVecs: int, chemicalPot=0,
-                    gamma=np.array([[1j,0],[0,-1j]])):
+                    gamma=np.array([[1j,0],[0,-1j]]), momk=0):
 
-    peramb = buildPerambulator(modelObj,configIndex, numVecs, chemicalPot)
+    peramb = buildPerambulator(modelObj, configIndex, numVecs, momk=momk, chemicalPot=chemicalPot)
 
     elemental = np.kron(np.eye(numVecs),gamma)
 

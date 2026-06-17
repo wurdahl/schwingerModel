@@ -3,21 +3,22 @@ from joblib import Parallel, delayed
 import pickle
 import schwingerModel as sim
 
-m = 0.2
 a = 1
-dimx = 16*3
-dimt = 32*3
+dimx = int(16*3)
+dimt = int(32*3)
 
 R = 10/(32*16) #ratio that we want to keep constant while taking continuum limit
 
 beta = R*dimx*dimt
+
+m = 0.2 *np.sqrt(10/beta)
 
 targetConfigs = 50000
 burnIn = 500
 nThreads = 16
 stepsPerChain = targetConfigs // nThreads
 
-subSteps = 300
+subSteps = 350
 
 def run_chain(seed):
     model = sim.schwingerModel(
