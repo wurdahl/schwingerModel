@@ -446,6 +446,79 @@ def getEffMassRhoBar(modelObj: schwingerModel):
 
     return rhoBar
 
+def getNumDensityRhoBar(modelObj: schwingerModel, burnIn=0, chemicalPot=0.0):
+    """Compute the normalized autocorrelation function rhoBar for the number density.
+
+    Iterates over every post-burn-in configuration (no thinning — thinning
+    would distort the autocorrelation time estimate) and collects the
+    vacuum-subtracted number density per config.  When reweighting is active
+    (chemicalPot != 0), the per-config contribution to the estimator numerator
+    ``w_i * (n_mu_i - n_0_i)`` is used as the observable so that the resulting
+    tau_int reflects the autocorrelation time of the actual weighted estimator.
+    If the sign problem is negligible (validity ~ 1), the difference from the
+    unweighted series is small.
+
+    Parameters
+    ----------
+    modelObj : schwingerModel
+        Lattice model containing gauge link history and parameters.
+    burnIn : int
+        Number of initial configurations to discard as thermalization.
+    chemicalPot : float
+        Chemical potential at which to evaluate the number density.
+
+    Returns
+    -------
+    rhoBar : ndarray
+        Normalized autocorrelation function.  Pass this together with
+        ``N_conf = len(rhoBar)`` to ``get_integrated_autocorr_time_statistical``.
+    """
+    V = modelObj.a**2 * modelObj.dimx * modelObj.dimt
+
+    n_mu_samples = []
+    n_0_samples  = []
+    weights      = []
+
+    for i in tqdm(range(burnIn, modelObj.metroSteps)):
+        links = modelObj.linkHistory[i]
+
+        dOp   = ops.buildDiracOp(modelObj, links).toarray()
+        dOpmu = ops.buildDiracOp(modelObj, links, chemicalPot).toarray()
+
+        D_mu = np.linalg.inv(dOpmu)
+        D_0  = np.linalg.inv(dOp)
+
+        n_mu = ops.buildNumberDensOp(modelObj, links, chemicalPot)
+        n_0  = ops.buildNumberDensOp(modelObj, links, 0.0)
+
+        n_mu_samples.append(n_mu.multiply(D_mu.T).sum() / V)
+        n_0_samples.append(n_0.multiply(D_0.T).sum() / V)
+
+        if chemicalPot != 0.0:
+            sign_0, logdet_0 = np.linalg.slogdet(dOp)
+            sign_mu, logdet_mu = np.linalg.slogdet(dOpmu)
+            weights.append((sign_mu / sign_0) * np.exp(logdet_mu - logdet_0))
+        else:
+            weights.append(1.0)
+
+    n_mu_samples = np.array(n_mu_samples)
+    n_0_samples  = np.array(n_0_samples)
+    # square weights: two degenerate fermions (matches getWeightingFactors)
+    weights = np.array(weights)**2
+
+    mean_w = np.mean(weights)
+    # observable: contribution to the estimator numerator, normalised by mean weight
+    obs = np.real(weights * (n_mu_samples - n_0_samples) / mean_w)
+
+    nSamp = len(obs)
+    GammaBar = 1 / (nSamp - np.arange(nSamp)) * (
+        np.correlate(obs - np.mean(obs), obs - np.mean(obs), mode='full')[nSamp - 1:]
+    )
+    rhoBar = GammaBar / GammaBar[0]
+
+    return rhoBar
+
+
 def get_integrated_autocorr_time_statistical(rho_bar, N_conf):
     """
     Extracts the integrated autocorrelation time (tau_int) and its error 

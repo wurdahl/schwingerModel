@@ -18,7 +18,12 @@ burnIn = 500
 nThreads = 16
 stepsPerChain = targetConfigs // nThreads
 
-subSteps = 350
+subSteps = 35
+
+beta = 10
+m = .2
+dimt = 16
+dimx = 8
 
 def run_chain(seed):
     model = sim.schwingerModel(
@@ -39,5 +44,5 @@ if __name__ == '__main__':
     base.metroSteps = targetConfigs
     base.storedProps = [None] * targetConfigs
 
-    with open('configs/50kSteps_scale_3.pkl', 'wb') as f:
+    with open('configs/raulComp.pkl', 'wb') as f:
         pickle.dump(base, f)
