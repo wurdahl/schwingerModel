@@ -430,6 +430,41 @@ def getWeightingFactorsTheta(modelObj: schwingerModel, theta=0, burnIn=1,autocor
 
     return np.exp(1j*theta*np.array(weights)/(2*np.pi))
 
+
+def getChiralCondensate(modelObj: schwingerModel, gaugeIndex = 0):
+
+    dOp = ops.buildDiracOp(modelObj, modelObj.linkHistory[gaugeIndex])
+
+    prop = np.linalg.inv(dOp.toarray())
+
+    stridex = modelObj.dimt*2
+    stridet = 2
+
+    # Store the local trace Tr[Gamma S(x,t; x,t)] for every point
+    condensate = np.zeros((modelObj.dimt, modelObj.dimx), dtype=complex)
+
+    for t in range(modelObj.dimt):           
+        for x in range(modelObj.dimx):
+            idx_start = x * stridex + t * stridet
+            idx_end = idx_start + 2
+            propxx = prop[idx_start:idx_end, idx_start:idx_end]
+            condensate[t, x] = np.trace(propxx)
+
+    condensate_avg = np.mean(condensate).real
+
+    return condensate_avg
+
+def getCondensateStats(modelObj: schwingerModel, burnIn = 1, autocorrSkip = 1):
+
+    condensates = []
+
+    for gaugeIndex in range(burnIn, modelObj.metroSteps, autocorrSkip):
+        condensates.append(getChiralCondensate(modelObj, gaugeIndex))
+
+    condensates = np.array(condensates)
+
+    return np.array([np.mean(condensates), np.std(condensates)])
+
 def getEffMassRhoBar(modelObj: schwingerModel):
     allCorrs = []
     nSamp=modelObj.metroSteps
