@@ -69,7 +69,7 @@ def findPartialEigenBasis(modelObj: schwingerModel, configIndex = 0, numVecs = 4
 
     return np.array(eigenBases) #shape: (dimt, dimx, numVecs)
 
-def buildPerambulator(modelObj: schwingerModel, configIndex: int, numVecs: int, momk=0, chemicalPot=0):
+def buildPerambulator(modelObj: schwingerModel, configIndex: int, numVecs: int, chemicalPot=0):
     """
     Computes the distillation perambulator for a single gauge configuration.
 
@@ -79,10 +79,6 @@ def buildPerambulator(modelObj: schwingerModel, configIndex: int, numVecs: int, 
     """
     gaugeLinks = modelObj.linkHistory[configIndex]
     eigVecs = findPartialEigenBasis(modelObj, configIndex, numVecs)
-
-    #do momentum projection to partial eigenbasis
-    momPhases = np.exp(-1j*2*np.pi*momk*np.arange(modelObj.dimx)/modelObj.dimx)
-    eigVecs = eigVecs * momPhases[np.newaxis,:,np.newaxis]
 
     # eigVecs shape: (dimt, dimx, numVecs)
 
@@ -109,9 +105,9 @@ def buildPerambulator(modelObj: schwingerModel, configIndex: int, numVecs: int, 
     return tau
 
 def getCorrelation(modelObj: schwingerModel, configIndex: int, numVecs: int, chemicalPot=0,
-                    gamma=np.array([[1j,0],[0,-1j]]), momk=0):
+                    gamma=np.array([[1j,0],[0,-1j]])):
 
-    peramb = buildPerambulator(modelObj, configIndex, numVecs, momk=momk, chemicalPot=chemicalPot)
+    peramb = buildPerambulator(modelObj, configIndex, numVecs, chemicalPot=chemicalPot)
 
     elemental = np.kron(np.eye(numVecs),gamma)
 
@@ -125,10 +121,10 @@ def getCorrelation(modelObj: schwingerModel, configIndex: int, numVecs: int, che
     return correlator
 
 def getCorrelationLoop(modelObj: schwingerModel, configIndex: int, numVecs: int, chemicalPot=0,
-                    gamma=np.array([[1j,0],[0,-1j]]), momk=0):
+                    gamma=np.array([[1j,0],[0,-1j]])):
     #assuming isospin symmetry for everything
     
-    peramb = buildPerambulator(modelObj, configIndex, numVecs, momk=momk, chemicalPot=chemicalPot)
+    peramb = buildPerambulator(modelObj, configIndex, numVecs, chemicalPot=chemicalPot)
 
     elemental = np.kron(np.eye(numVecs),gamma)
 
