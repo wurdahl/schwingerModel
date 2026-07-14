@@ -124,32 +124,84 @@ def getCorrelation(modelObj: schwingerModel, configIndex: int, numVecs: int, che
 
     return correlator
 
+def getCorrelationLoop(modelObj: schwingerModel, configIndex: int, numVecs: int, chemicalPot=0,
+                    gamma=np.array([[1j,0],[0,-1j]]), momk=0):
+    #assuming isospin symmetry for everything
+    
+    peramb = buildPerambulator(modelObj, configIndex, numVecs, momk=momk, chemicalPot=chemicalPot)
+
+    elemental = np.kron(np.eye(numVecs),gamma)
+
+    trace = np.einsum("iikl,lk->i",peramb,elemental,optimize=True)
+
+    return trace
+
 def correlStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
-                    Gamma=np.array([[1j,0],[0,-1j]]), nVec=2, chemicalPot=0, theta=0):
+                    Gamma=np.array([[1j,0],[0,-1j]]), nVec=2, chemicalPot=0, theta=0,disc=False):
     
     weights = getWeightingFactorsTheta(modelObj, theta=theta,burnIn=burnIn, autocorrSkip=autocorrSkip)
     
     indices = np.arange(burnIn, modelObj.metroSteps, autocorrSkip)
-    with tqdm_joblib(tqdm(total=len(indices), desc="configs")):
+    with tqdm_joblib(tqdm(total=len(indices), desc="Conn. configs")):
         correl = np.array(Parallel(n_jobs=-1)(delayed(getCorrelation)(modelObj, i, nVec, gamma=Gamma,chemicalPot=chemicalPot) for i in indices))
+
+    if(disc):
+        with tqdm_joblib(tqdm(total=len(indices), desc="Disc. Loops")):
+            loops = np.array(Parallel(n_jobs=-1)(delayed(getCorrelationLoop)(modelObj, i, nVec, gamma=Gamma,chemicalPot=chemicalPot) for i in indices))
+        # loops shape: (n_configs, dimt), loops[n,t] = L_n(t) = Tr[Phi tau(t,t)]
 
     totalCorrelMean = np.real(np.average(correl,axis=0,weights=weights))
 
-    #bootstrapping
+    if(disc):
+        dimt = modelObj.dimt
+
+        # per-config, translation-averaged loop-loop product on the SAME config:
+        #   loopCorrel[n, dt] = (1/T) sum_t L_n(t+dt) L_n(t)
+        loopCorrel = np.stack([
+            np.mean(np.roll(loops, -dt, axis=1) * loops, axis=1)
+            for dt in range(dimt)
+        ], axis=1)                                       # (n_configs, dimt)
+
+        def _discCorrel(llc, lp, w):
+            # llc, lp: (..., n_configs, dimt); w: (..., n_configs)
+            # returns vacuum-subtracted disconnected correlator (..., dimt)
+            ws   = np.sum(w, axis=-1, keepdims=True)
+            LL   = np.sum(llc * w[..., None], axis=-2) / ws          # <(1/T) sum_t L(t+dt)L(t)>
+            Lbar = np.sum(lp  * w[..., None], axis=-2) / ws          # <L(t)>  (..., dimt)
+            vac  = np.stack([                                        # (1/T) sum_t <L(t+dt)><L(t)>
+                np.mean(np.roll(Lbar, -dt, axis=-1) * Lbar, axis=-1)
+                for dt in range(dimt)
+            ], axis=-1)
+            return LL - vac
+
+        totalCorrelMean = totalCorrelMean + np.real(_discCorrel(loopCorrel, loops, weights))
+
+    # Chunked bootstrap: never materialise (numResamples, n_configs, dimt) all at
+    # once — instead process in small batches and accumulate the per-sample means.
     numResamples = 10000
+    chunk_size   = 500
     rng = np.random.default_rng()
 
-    resamples = rng.choice(len(correl), size=(numResamples, len(correl)))
+    bootstrap_means = np.empty((numResamples, modelObj.dimt))
 
-    # (numResamples, n_configs, dimt)
-    correl_boot = correl[resamples]
-    w_boot = weights[resamples]
+    for start in range(0, numResamples, chunk_size):
+        end     = min(start + chunk_size, numResamples)
+        idx     = rng.choice(len(correl), size=(end - start, len(correl)))
+        w_chunk = weights[idx]                           # (chunk, n_configs)
 
-    # weighted mean for each bootstrap sample -> (numResamples, dimt)
-    bootstrap_means = np.real(
-        np.sum(correl_boot * w_boot[:, :, np.newaxis], axis=1) /
-        np.sum(w_boot, axis=1, keepdims=True)
-    )
+        correl_chunk = correl[idx]                       # (chunk, n_configs, dimt)
+        chunk_means  = np.real(
+            np.sum(correl_chunk * w_chunk[:, :, np.newaxis], axis=1) /
+            np.sum(w_chunk, axis=1, keepdims=True)
+        )
+        del correl_chunk
+
+        if(disc):
+            chunk_means = chunk_means + np.real(
+                _discCorrel(loopCorrel[idx], loops[idx], w_chunk)
+            )
+
+        bootstrap_means[start:end] = chunk_means
 
     low  = np.percentile(bootstrap_means, 2.5,  axis=0)
     high = np.percentile(bootstrap_means, 97.5, axis=0)

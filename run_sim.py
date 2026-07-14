@@ -4,26 +4,24 @@ import pickle
 import schwingerModel as sim
 
 a = 1
-dimx = int(16*3)
-dimt = int(32*3)
+dimx = 4
+dimt = 24
 
 R = 10/(32*16) #ratio that we want to keep constant while taking continuum limit
 
-beta = R*dimx*dimt
+# beta = R*dimx*dimt
+beta = 2.0
 
-m = 0.2 *np.sqrt(10/beta)
+# m = 0.2 *np.sqrt(10/beta)
+m=1
 
 targetConfigs = 50000
 burnIn = 500
 nThreads = 16
 stepsPerChain = targetConfigs // nThreads
 
-subSteps = 35
+subSteps = 25
 
-beta = 10
-m = .2
-dimt = 16
-dimx = 8
 
 def run_chain(seed):
     model = sim.schwingerModel(
@@ -44,5 +42,5 @@ if __name__ == '__main__':
     base.metroSteps = targetConfigs
     base.storedProps = [None] * targetConfigs
 
-    with open('configs/raulComp.pkl', 'wb') as f:
+    with open('configs/raulCompTheta.pkl', 'wb') as f:
         pickle.dump(base, f)
