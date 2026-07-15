@@ -135,13 +135,13 @@ def derivativeKernel(numDerivs):
     return kernel
 
 def buildElemental(modelObj: schwingerModel, configIndex:int, numVecs: int, kernel=None,
-                    gamma=np.array([[1j,0],[0,-1j]]), eigVecs=None):
+                    gamma=np.array([[1j,0],[0,-1j]]), momk=0, eigVecs=None):
     """
     Builds the meson elemental for one configuration:
-        Phi[t] = kron( V(t)^dag K(t) V(t), gamma )
+        Phi[t] = kron( V(t)^dag e^{-i 2pi momk x/L} K(t) V(t), gamma )
     shape (dimt, numVecs*2, numVecs*2) with the compound index l*2+s matching
     buildPerambulator. kernel=None means the identity spatial kernel, for which
-    orthonormality of V gives Phi[t] = kron(eye(numVecs), gamma) at every t.
+    (at momk=0) orthonormality of V gives Phi[t] = kron(eye(numVecs), gamma).
     """
     gaugeLinks = modelObj.linkHistory[configIndex]
     if eigVecs is None:
@@ -149,12 +149,16 @@ def buildElemental(modelObj: schwingerModel, configIndex:int, numVecs: int, kern
 
     N_t, N_x, N_vec = eigVecs.shape
 
+    #momentum projection phase, applied on the psibar side
+    phase = np.exp(-1j*2*np.pi*momk*np.arange(N_x)/N_x)
+
     elemental = np.zeros((N_t, N_vec*2, N_vec*2), dtype=complex)
     for nt in range(N_t):
         if kernel is None:
-            vkv = eigVecs[nt].conj().T @ eigVecs[nt]
+            Kv = eigVecs[nt]
         else:
-            vkv = eigVecs[nt].conj().T @ (kernel(modelObj, gaugeLinks, nt) @ eigVecs[nt])
+            Kv = kernel(modelObj, gaugeLinks, nt) @ eigVecs[nt]
+        vkv = eigVecs[nt].conj().T @ (phase[:,None] * Kv)
         elemental[nt] = np.kron(vkv, gamma)
 
     return elemental
@@ -202,21 +206,28 @@ class distillationSpace:
                                                                  self.numVecs, chemicalPot=self.chemicalPot)
         return self._perambulators[configIndex]
 
-    def elemental(self, configIndex, op: wick.mesonOp):
+    def elemental(self, configIndex, op):
+        """op is anything with .name/.gamma/.kernel/.momk (mesonOp or bilinear)."""
         if (configIndex, op.name) not in self._elementals:
             self._elementals[(configIndex, op.name)] = buildElemental(
                 self.modelObj, configIndex, self.numVecs, kernel=op.kernel,
-                gamma=op.gamma, eigVecs=self.eigenBasis(configIndex))
+                gamma=op.gamma, momk=getattr(op, 'momk', 0),
+                eigVecs=self.eigenBasis(configIndex))
         return self._elementals[(configIndex, op.name)]
 
-    def elementalBar(self, configIndex, op: wick.mesonOp):
+    def elementalBar(self, configIndex, op):
         """
-        Elemental of the daggered operator: (psibar G K psi)^dag = psibar Gbar K^dag psi
-        with Gbar = gammat G^dag gammat, so PhiBar[t] = Phi[t]^dag conjugated by gammat.
+        Elemental of the daggered operator:
+            (psibar G e^{-ikx} K psi)^dag = psibar Gbar K^dag e^{+ikx} psi
+        with Gbar = gammat G^dag gammat, so PhiBar[t] = Phi[t]^dag conjugated by gammat
+        (the momentum flip comes along with the dagger of the spatial part).
         """
-        gt = np.kron(np.eye(self.numVecs), self.modelObj.gammat)
-        phi = self.elemental(configIndex, op)
-        return gt @ phi.conj().transpose(0,2,1) @ gt
+        key = (configIndex, op.name + "__bar")
+        if key not in self._elementals:
+            gt = np.kron(np.eye(self.numVecs), self.modelObj.gammat)
+            phi = self.elemental(configIndex, op)
+            self._elementals[key] = gt @ phi.conj().transpose(0,2,1) @ gt
+        return self._elementals[key]
 
 def getElementalCorrelMatrix(modelObj: schwingerModel, configIndex: int, numVecs: int, ops,
                               chemicalPot=0):
@@ -259,6 +270,218 @@ def getElementalCorrelMatrix(modelObj: schwingerModel, configIndex: int, numVecs
             ])
 
     return conn, loopsSnk, loopsSrc
+
+def pionBasis(derivCounts=(0, 2), pipiMomenta=(1,), gamma=None):
+    """
+    GEVP basis of interpOps that all share the pion quantum numbers
+    (I=1, I3=+1, P=-1, total momentum 0):
+      - single pions psibar_d [g5 D^n] psi_u for each n in derivCounts
+        (only EVEN n keeps P=-1; odd n is a different channel)
+      - two-pion operators pi(k)pi(-k) in the antisymmetric I=1 combination
+        for each k in pipiMomenta
+    """
+    ops = []
+    for nD in derivCounts:
+        kernel = derivativeKernel(nD) if nD > 0 else None
+        ops.append(wick.singleMesonOp(f"pi_D{nD}", wick.PION_PLUS, gamma, kernel))
+    for k in pipiMomenta:
+        ops.append(wick.piPiOpI1(k, gamma))
+    return ops
+
+def _cycleTrace(phis, tau, timeSyms):
+    """
+    One fermion loop of a Wick contraction:
+        Tr[ Phi_1(T_1) tau(T_1,T_2) Phi_2(T_2) tau(T_2,T_3) ... tau(T_k,T_1) ]
+    phis: list of (dimt, N, N) elementals along the cycle
+    timeSyms: 's' (sink time) or 'r' (source time) for each vertex
+    Returns the trace as an array over the distinct times present:
+    shape (dimt, dimt) as (t_snk, t_src) if both appear, else (dimt,).
+    """
+    letters = 'abcdefghijklmnop'
+    k = len(phis)
+
+    subs = []
+    operands = []
+    for j in range(k):
+        row, col = letters[2*j], letters[2*j+1]
+        nxt = letters[(2*j+2) % (2*k)]
+        subs.append(timeSyms[j] + row + col)
+        operands.append(phis[j])
+        subs.append(timeSyms[j] + timeSyms[(j+1) % k] + col + nxt)
+        operands.append(tau)
+
+    out = ('s' if 's' in timeSyms else '') + ('r' if 'r' in timeSyms else '')
+
+    return np.einsum(','.join(subs) + '->' + out, *operands, optimize=True)
+
+def getInterpCorrelMatrix(modelObj: schwingerModel, configIndex: int, numVecs: int, ops,
+                           chemicalPot=0):
+    """
+    Per-configuration correlation matrix for general interpOps (sums of products
+    of bilinears, e.g. mixed single-meson / multi-meson bases):
+        C[i,j,dt] = (1/T) sum_t  [all Wick contractions of O_i(t+dt) O_j(t)^dag]
+    Contractions are generated by the permutation method (wick.wickContractions)
+    on the flavor labels; every cycle becomes a trace over elementals and
+    perambulators via _cycleTrace, and the contraction carries (-1)^{#loops}.
+
+    Also returns per-op VEV series (vevSnk[i,t] = <O_i(t)>_config and
+    vevSrc[j,t] = <O_j(t)^dag>_config) so the driver can do ensemble-level
+    vacuum subtraction; these vanish identically for I != 0 channels.
+    """
+    space = distillationSpace(modelObj, numVecs, chemicalPot=chemicalPot)
+    tau = space.perambulator(configIndex)
+
+    nOps = len(ops)
+    dimt = modelObj.dimt
+
+    cycleCache = {}
+
+    def cycleVal(verts, cycle):
+        #verts: list of (bilinear, timeSym, barred); cycle: tuple of vertex indices
+        #canonicalize under rotation so equivalent loops share a cache entry
+        labels = tuple((verts[i][0].name, verts[i][1], verts[i][2]) for i in cycle)
+        rotations = [labels[r:] + labels[:r] for r in range(len(labels))]
+        key = min(rotations)
+
+        if key not in cycleCache:
+            rot = rotations.index(key)
+            order = cycle[rot:] + cycle[:rot]
+            phis = [space.elementalBar(configIndex, verts[i][0]) if verts[i][2]
+                    else space.elemental(configIndex, verts[i][0]) for i in order]
+            timeSyms = [verts[i][1] for i in order]
+            cycleCache[key] = (_cycleTrace(phis, tau, timeSyms), ''.join(sorted(set(timeSyms))))
+        return cycleCache[key]
+
+    def contractTerms(verts):
+        #sum of all Wick contractions as an array over (t_snk, t_src)
+        #effective (barFlavor, flavor) of each vertex: daggering swaps them
+        eff = [(b.flavor, b.barFlavor) if barred else (b.barFlavor, b.flavor)
+               for b, ts, barred in verts]
+
+        acc = np.zeros((dimt, dimt), dtype=complex)
+        for sign, cycles in wick.wickContractions(eff):
+            val = np.ones((dimt, dimt), dtype=complex)
+            for cycle in cycles:
+                arr, syms = cycleVal(verts, cycle)
+                if syms == 'rs':
+                    val = val * arr
+                elif syms == 's':
+                    val = val * arr[:, None]
+                else:
+                    val = val * arr[None, :]
+            acc += sign * val
+        return acc
+
+    C = np.zeros((nOps, nOps, dimt), dtype=complex)
+    vevSnk = np.zeros((nOps, dimt), dtype=complex)
+    vevSrc = np.zeros((nOps, dimt), dtype=complex)
+
+    for i, opSnk in enumerate(ops):
+        for j, opSrc in enumerate(ops):
+            full = np.zeros((dimt, dimt), dtype=complex)
+            for cS, bsS in opSnk.terms:
+                for cB, bsB in opSrc.terms:
+                    #sink bilinears at t_snk, daggered source bilinears at t_src
+                    verts = [(b, 's', False) for b in bsS] + [(b, 'r', True) for b in bsB]
+                    full += cS*np.conj(cB) * contractTerms(verts)
+
+            #average over source position at fixed separation
+            C[i,j] = np.array([
+                np.roll(full, -dt, axis=0).diagonal().mean()
+                for dt in range(dimt)
+            ])
+
+    #per-op VEV series for ensemble-level vacuum subtraction
+    for i, op in enumerate(ops):
+        for c, bs in op.terms:
+            vertsS = [(b, 's', False) for b in bs]
+            vertsB = [(b, 's', True) for b in bs]
+            vevSnk[i] += c * contractTerms(vertsS).diagonal()
+            vevSrc[i] += np.conj(c) * contractTerms(vertsB).diagonal()
+
+    return C, vevSnk, vevSrc
+
+def interpGEVPStats(modelObj: schwingerModel, ops, burnIn=1, autocorrSkip=1, numVecs=4,
+                    chemicalPot=0, theta=0, ti=1, numResamples=2000,
+                    vacuumSubtract=True, n_jobs=-1):
+    """
+    Distillation GEVP over a basis of general interpOps (single mesons with any
+    gamma / derivative kernel / momentum, and multi-meson operators) that share
+    the same quantum numbers, e.g. pionBasis(). All Wick contractions -- connected,
+    disconnected, and the box/triangle diagrams of multi-particle operators --
+    are generated automatically by the permutation method.
+
+    Returns [mean (dimt-ti, nOps), errors (2, dimt-ti, nOps), covMat (nOps, dimt-ti, dimt-ti)],
+    compatible with correlation.gevpMassExtract.
+    """
+    from .correlation import gevp
+
+    nOps = len(ops)
+    dimt = modelObj.dimt
+
+    weights = getWeightingFactorsTheta(modelObj, theta=theta, burnIn=burnIn, autocorrSkip=autocorrSkip)
+    indices = np.arange(burnIn, modelObj.metroSteps, autocorrSkip)
+
+    with tqdm_joblib(tqdm(total=len(indices), desc="Interp. configs")):
+        perConfig = Parallel(n_jobs=n_jobs)(
+            delayed(getInterpCorrelMatrix)(modelObj, i, numVecs, ops, chemicalPot=chemicalPot)
+            for i in indices)
+
+    C      = np.array([r[0] for r in perConfig])   # (n_configs, nOps, nOps, dimt)
+    vevSnk = np.array([r[1] for r in perConfig])   # (n_configs, nOps, dimt)
+    vevSrc = np.array([r[2] for r in perConfig])
+
+    def _meanMatrix(idx=None):
+        #weighted-mean correlation matrix with vacuum subtraction;
+        #idx indexes bootstrap resamples
+        if idx is None:
+            c, vS, vB, w = C, vevSnk, vevSrc, weights
+        else:
+            c, vS, vB, w = C[idx], vevSnk[idx], vevSrc[idx], weights[idx]
+
+        ws = np.sum(w, axis=-1)
+        Cm = np.sum(c * w[..., None, None, None], axis=-4) / ws[..., None, None, None]
+
+        if vacuumSubtract:
+            vSm = np.sum(vS * w[..., None, None], axis=-3) / ws[..., None, None]  # <O_i(t)>
+            vBm = np.sum(vB * w[..., None, None], axis=-3) / ws[..., None, None]  # <O_j(t)^dag>
+            # vac[i,j,dt] = (1/T) sum_t <O_i(t+dt)> <O_j(t)^dag>
+            vac = np.stack([
+                np.einsum('...it,...jt->...ij', np.roll(vSm, -dt, axis=-1), vBm)/dimt
+                for dt in range(dimt)
+            ], axis=-1)
+            Cm = Cm - vac
+        return Cm
+
+    def _gevpEigs(Cm):
+        # Cm: (nOps, nOps, dimt) -> sorted eigenvalue correlators (dimt-ti, nOps)
+        corrMat = np.real((Cm + np.conj(np.swapaxes(Cm, 0, 1)))/2)  #hermitize
+        newCorrs, _ = gevp(corrMat, ti=ti)
+        return np.real(newCorrs)
+
+    totalCorrelMean = _gevpEigs(_meanMatrix())
+
+    #chunked bootstrap over configurations
+    chunk_size = 500
+    rng = np.random.default_rng()
+
+    bootstrap_means = np.empty((numResamples, dimt - ti, nOps))
+
+    for start in range(0, numResamples, chunk_size):
+        end = min(start + chunk_size, numResamples)
+        idx = rng.choice(len(C), size=(end - start, len(C)))
+
+        C_chunk = _meanMatrix(idx)
+        for s in range(end - start):
+            bootstrap_means[start + s] = _gevpEigs(C_chunk[s])
+        del C_chunk
+
+    low  = np.percentile(bootstrap_means, 2.5,  axis=0)
+    high = np.percentile(bootstrap_means, 97.5, axis=0)
+
+    covMat = np.array([np.cov(bootstrap_means[:, :, eigIdx], rowvar=False) for eigIdx in range(nOps)])
+
+    return [totalCorrelMean, np.array([high - totalCorrelMean, totalCorrelMean - low]), covMat]
 
 def getCorrelation(modelObj: schwingerModel, configIndex: int, numVecs: int, chemicalPot=0,
                     gamma=np.array([[1j,0],[0,-1j]])):

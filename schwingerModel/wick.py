@@ -2,11 +2,23 @@ import numpy as np
 import itertools
 from collections import namedtuple
 
+GAMMA5 = np.array([[1j,0],[0,-1j]])
+
 #a meson interpolating operator O = psibar Gamma K psi
 #   gamma: (2,2) dirac structure
 #   kernel: spatial kernel builder kernel(modelObj, gaugeLinks, nt) -> (dimx,dimx),
 #           or None for the identity (e.g. derivativeKernel(n) from distillation.py)
-mesonOp = namedtuple('mesonOp', ['name', 'gamma', 'kernel'])
+#   momk: integer momentum mode, projects with e^{-i 2 pi momk x / dimx}
+mesonOp = namedtuple('mesonOp', ['name', 'gamma', 'kernel', 'momk'], defaults=(0,))
+
+#a single fermion bilinear factor psibar_barFlavor [Gamma (x) e^{-i 2pi momk x/L} K] psi_flavor
+#   name keys the elemental cache, so it must uniquely identify (gamma, kernel, momk)
+bilinear = namedtuple('bilinear', ['name', 'barFlavor', 'flavor', 'gamma', 'kernel', 'momk'])
+
+#a general interpolating operator: a sum of products of bilinears
+#   terms: tuple of (coeff, (bilinear, bilinear, ...))
+#single mesons have one bilinear per term, multi-particle operators have several
+interpOp = namedtuple('interpOp', ['name', 'terms'])
 
 #flavor structure of a meson channel: list of (coeff, barFlavor, flavor) terms
 #   O = sum_terms coeff * psibar_barFlavor Gamma psi_flavor
@@ -84,3 +96,47 @@ def twoPointCoeffs(flavorTermsSnk, flavorTermsSrc=None):
                     discCoeff += cSnk*np.conj(cSrc)*sign
 
     return connCoeff, discCoeff
+
+
+def singleMesonOp(name, flavorTerms=PION_PLUS, gamma=None, kernel=None, momk=0):
+    """
+    Single-meson interpOp: O = sum_terms coeff * psibar_bf [Gamma e^{-i2pi k x/L} K] psi_f
+    All flavor terms share one elemental (keyed by name), so name must be unique
+    per (gamma, kernel, momk) within a basis.
+    """
+    if gamma is None:
+        gamma = GAMMA5
+    b = lambda fb, f: bilinear(name, fb, f, gamma, kernel, momk)
+    terms = tuple((c, (b(fb, f),)) for c, fb, f in flavorTerms)
+    return interpOp(name, terms)
+
+
+def productOp(name, opA, opB):
+    """Product of two interpOps, e.g. a two-meson operator (bilinears commute)."""
+    terms = tuple((cA*cB, bsA + bsB) for cA, bsA in opA.terms for cB, bsB in opB.terms)
+    return interpOp(name, terms)
+
+
+def opSum(name, coeffsAndOps):
+    """Linear combination of interpOps: coeffsAndOps = [(coeff, op), ...]."""
+    terms = tuple((c*ct, bs) for c, op in coeffsAndOps for ct, bs in op.terms)
+    return interpOp(name, terms)
+
+
+def piPiOpI1(momk, gamma=None, kernel=None):
+    """
+    Two-pion operator with single-pion quantum numbers (I=1, I3=+1, P=-1) at zero
+    total momentum:
+        O = i [ pi+(k) pi0(-k) - pi+(-k) pi0(k) ] / sqrt(2)
+    The antisymmetric momentum wavefunction pairs with the antisymmetric (I=1)
+    flavor combination, and gives overall parity -1 (two P=-1 pions, odd spatial).
+    The overall i makes the cross-correlators with single-pion operators real,
+    so the GEVP correlation matrix stays real symmetric.
+    """
+    pipPos = singleMesonOp(f"pip_k{momk}",  PION_PLUS, gamma, kernel,  momk)
+    pipNeg = singleMesonOp(f"pip_k{-momk}", PION_PLUS, gamma, kernel, -momk)
+    pi0Pos = singleMesonOp(f"pi0_k{momk}",  PION_ZERO, gamma, kernel,  momk)
+    pi0Neg = singleMesonOp(f"pi0_k{-momk}", PION_ZERO, gamma, kernel, -momk)
+
+    return opSum(f"pipi_I1_k{momk}", [( 1j/np.sqrt(2), productOp("_", pipPos, pi0Neg)),
+                                      (-1j/np.sqrt(2), productOp("_", pipNeg, pi0Pos))])
