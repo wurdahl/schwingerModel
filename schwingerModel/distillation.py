@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import scipy.sparse as sparse
+from scipy.linalg import eigh
 from scipy.sparse.linalg import splu
 from scipy.stats import bootstrap
 from scipy.optimize import curve_fit
@@ -60,8 +63,12 @@ def findPartialEigenBasis(modelObj: schwingerModel, configIndex = 0, numVecs = 4
     for nt in range(modelObj.dimt):
         lap = -buildLaplacian(modelObj, modelObj.linkHistory[configIndex], nt=nt)
 
-        #This should find the smallest eigenvalues/eigenvectors of the laplacian
-        eigs, eigVecs = sparse.linalg.eigsh(lap, k=numVecs,sigma=0, which='LM')
+        #dense solve for the smallest numVecs eigenvectors: the laplacian is only
+        #(dimx, dimx), and unlike ARPACK (random starting vector) this is fully
+        #deterministic -- matters when numVecs cuts through a near-degenerate
+        #+-momentum pair, where the selected subspace is otherwise run-dependent
+        lapDense = lap.toarray() if sparse.issparse(lap) else np.asarray(lap)
+        eigs, eigVecs = eigh(lapDense, subset_by_index=[0, numVecs-1])
 
         #momentum projection
         # eigVecs *= np.exp(-1j*2*np.pi*momk*np.arange(modelObj.dimx)/modelObj.dimx)
@@ -184,35 +191,70 @@ class distillationSpace:
     Manages the distillation objects for one model: eigenvector bases,
     perambulators, and elementals are computed lazily and cached per
     configuration (and per operator for the elementals).
+
+    cacheDir: optional directory for persistent storage. Perambulators,
+    eigenbases, and elementals are saved as .npy files keyed by configuration,
+    numVecs, chemical potential, and operator name, so repeated analyses
+    (different operator bases, other channels) skip the Dirac solves entirely.
+    Parallel workers write distinct files, so the cache is safe under joblib.
     """
 
-    def __init__(self, modelObj: schwingerModel, numVecs: int, chemicalPot=0):
+    def __init__(self, modelObj: schwingerModel, numVecs: int, chemicalPot=0, cacheDir=None):
         self.modelObj = modelObj
         self.numVecs = numVecs
         self.chemicalPot = chemicalPot
+
+        self.cacheDir = cacheDir
+        if cacheDir is not None:
+            os.makedirs(cacheDir, exist_ok=True)
 
         self._eigenBases = {}
         self._perambulators = {}
         self._elementals = {}   # keyed by (configIndex, op.name)
 
+    def _diskLoad(self, fname):
+        if self.cacheDir is None:
+            return None
+        path = os.path.join(self.cacheDir, fname)
+        return np.load(path) if os.path.exists(path) else None
+
+    def _diskSave(self, fname, arr):
+        if self.cacheDir is not None:
+            np.save(os.path.join(self.cacheDir, fname), arr)
+
     def eigenBasis(self, configIndex):
         if configIndex not in self._eigenBases:
-            self._eigenBases[configIndex] = findPartialEigenBasis(self.modelObj, configIndex, self.numVecs)
+            fname = f"eigbasis_nv{self.numVecs}_cfg{configIndex}.npy"
+            basis = self._diskLoad(fname)
+            if basis is None:
+                basis = findPartialEigenBasis(self.modelObj, configIndex, self.numVecs)
+                self._diskSave(fname, basis)
+            self._eigenBases[configIndex] = basis
         return self._eigenBases[configIndex]
 
     def perambulator(self, configIndex):
         if configIndex not in self._perambulators:
-            self._perambulators[configIndex] = buildPerambulator(self.modelObj, configIndex,
-                                                                 self.numVecs, chemicalPot=self.chemicalPot)
+            fname = f"peramb_nv{self.numVecs}_mu{self.chemicalPot:g}_cfg{configIndex}.npy"
+            tau = self._diskLoad(fname)
+            if tau is None:
+                tau = buildPerambulator(self.modelObj, configIndex,
+                                        self.numVecs, chemicalPot=self.chemicalPot)
+                self._diskSave(fname, tau)
+            self._perambulators[configIndex] = tau
         return self._perambulators[configIndex]
 
     def elemental(self, configIndex, op):
         """op is anything with .name/.gamma/.kernel/.momk (mesonOp or bilinear)."""
         if (configIndex, op.name) not in self._elementals:
-            self._elementals[(configIndex, op.name)] = buildElemental(
-                self.modelObj, configIndex, self.numVecs, kernel=op.kernel,
-                gamma=op.gamma, momk=getattr(op, 'momk', 0),
-                eigVecs=self.eigenBasis(configIndex))
+            fname = f"elem_{op.name}_nv{self.numVecs}_cfg{configIndex}.npy"
+            phi = self._diskLoad(fname)
+            if phi is None:
+                phi = buildElemental(
+                    self.modelObj, configIndex, self.numVecs, kernel=op.kernel,
+                    gamma=op.gamma, momk=getattr(op, 'momk', 0),
+                    eigVecs=self.eigenBasis(configIndex))
+                self._diskSave(fname, phi)
+            self._elementals[(configIndex, op.name)] = phi
         return self._elementals[(configIndex, op.name)]
 
     def elementalBar(self, configIndex, op):
@@ -315,7 +357,7 @@ def _cycleTrace(phis, tau, timeSyms):
     return np.einsum(','.join(subs) + '->' + out, *operands, optimize=True)
 
 def getInterpCorrelMatrix(modelObj: schwingerModel, configIndex: int, numVecs: int, ops,
-                           chemicalPot=0):
+                           chemicalPot=0, cacheDir=None):
     """
     Per-configuration correlation matrix for general interpOps (sums of products
     of bilinears, e.g. mixed single-meson / multi-meson bases):
@@ -328,7 +370,7 @@ def getInterpCorrelMatrix(modelObj: schwingerModel, configIndex: int, numVecs: i
     vevSrc[j,t] = <O_j(t)^dag>_config) so the driver can do ensemble-level
     vacuum subtraction; these vanish identically for I != 0 channels.
     """
-    space = distillationSpace(modelObj, numVecs, chemicalPot=chemicalPot)
+    space = distillationSpace(modelObj, numVecs, chemicalPot=chemicalPot, cacheDir=cacheDir)
     tau = space.perambulator(configIndex)
 
     nOps = len(ops)
@@ -401,9 +443,42 @@ def getInterpCorrelMatrix(modelObj: schwingerModel, configIndex: int, numVecs: i
 
     return C, vevSnk, vevSrc
 
+def computeInterpCorrelData(modelObj: schwingerModel, ops, burnIn=1, autocorrSkip=1,
+                            numVecs=4, chemicalPot=0, cacheDir=None, n_jobs=-1):
+    """
+    Precomputes the theta-INDEPENDENT per-configuration pieces of the interp GEVP
+    analysis: correlation matrices and VEV series for every configuration.
+    Theta reweighting only changes the per-config weights, so one of these
+    datasets supports a whole theta scan via interpGEVPStats(..., data=data,
+    theta=...) at essentially zero marginal cost per theta point.
+
+    The returned dict is picklable -- save it to disk to reuse across sessions.
+    cacheDir additionally persists the underlying perambulators / eigenbases /
+    elementals as .npy files (see distillationSpace), so building a NEW dataset
+    (e.g. a different operator basis) also skips the Dirac solves.
+    """
+    indices = np.arange(burnIn, modelObj.metroSteps, autocorrSkip)
+
+    with tqdm_joblib(tqdm(total=len(indices), desc="Interp. configs")):
+        perConfig = Parallel(n_jobs=n_jobs)(
+            delayed(getInterpCorrelMatrix)(modelObj, i, numVecs, ops,
+                                           chemicalPot=chemicalPot, cacheDir=cacheDir)
+            for i in indices)
+
+    return {
+        'C':      np.array([r[0] for r in perConfig]),  # (n_configs, nOps, nOps, dimt)
+        'vevSnk': np.array([r[1] for r in perConfig]),  # (n_configs, nOps, dimt)
+        'vevSrc': np.array([r[2] for r in perConfig]),
+        'indices': indices,
+        'burnIn': burnIn, 'autocorrSkip': autocorrSkip,
+        'numVecs': numVecs, 'chemicalPot': chemicalPot,
+        'opNames': [op.name for op in ops],
+    }
+
 def interpGEVPStats(modelObj: schwingerModel, ops, burnIn=1, autocorrSkip=1, numVecs=4,
                     chemicalPot=0, theta=0, ti=1, numResamples=2000,
-                    vacuumSubtract=True, thermalShift=False, n_jobs=-1):
+                    vacuumSubtract=True, thermalShift=False, data=None,
+                    cacheDir=None, n_jobs=-1):
     """
     Distillation GEVP over a basis of general interpOps (single mesons with any
     gamma / derivative kernel / momentum, and multi-meson operators) that share
@@ -418,6 +493,12 @@ def interpGEVPStats(modelObj: schwingerModel, ops, burnIn=1, autocorrSkip=1, num
     then decay as pure exponentials -- fit with an exp, not a cosh -- and the
     time extent of the output shrinks by one.
 
+    data: optional precomputed output of computeInterpCorrelData. The expensive
+    per-configuration pass is skipped and only the theta weights, bootstrap, and
+    GEVP run -- pass the same data with different theta values for a cheap
+    reweighting scan. When data is given, burnIn/autocorrSkip/numVecs/chemicalPot
+    are taken from it.
+
     Returns [mean (dimtEff-ti, nOps), errors (2, dimtEff-ti, nOps),
     covMat (nOps, dimtEff-ti, dimtEff-ti), refVecs (nOps, nOps)] with
     dimtEff = dimt-1 if thermalShift else dimt, compatible with
@@ -429,17 +510,22 @@ def interpGEVPStats(modelObj: schwingerModel, ops, burnIn=1, autocorrSkip=1, num
     nOps = len(ops)
     dimt = modelObj.dimt
 
-    weights = getWeightingFactorsTheta(modelObj, theta=theta, burnIn=burnIn, autocorrSkip=autocorrSkip)
-    indices = np.arange(burnIn, modelObj.metroSteps, autocorrSkip)
+    if data is None:
+        data = computeInterpCorrelData(modelObj, ops, burnIn=burnIn, autocorrSkip=autocorrSkip,
+                                       numVecs=numVecs, chemicalPot=chemicalPot,
+                                       cacheDir=cacheDir, n_jobs=n_jobs)
+    elif list(data['opNames']) != [op.name for op in ops]:
+        raise ValueError(f"ops {[op.name for op in ops]} do not match precomputed data {data['opNames']}")
 
-    with tqdm_joblib(tqdm(total=len(indices), desc="Interp. configs")):
-        perConfig = Parallel(n_jobs=n_jobs)(
-            delayed(getInterpCorrelMatrix)(modelObj, i, numVecs, ops, chemicalPot=chemicalPot)
-            for i in indices)
+    weights = getWeightingFactorsTheta(modelObj, theta=theta,
+                                       burnIn=data['burnIn'], autocorrSkip=data['autocorrSkip'])
 
-    C      = np.array([r[0] for r in perConfig])   # (n_configs, nOps, nOps, dimt)
-    vevSnk = np.array([r[1] for r in perConfig])   # (n_configs, nOps, dimt)
-    vevSrc = np.array([r[2] for r in perConfig])
+    C      = data['C']       # (n_configs, nOps, nOps, dimt)
+    vevSnk = data['vevSnk']  # (n_configs, nOps, dimt)
+    vevSrc = data['vevSrc']
+
+    #skip the vacuum-subtraction arithmetic when the VEVs vanish identically (I != 0 channels)
+    vacuumSubtract = vacuumSubtract and (np.any(vevSnk != 0) or np.any(vevSrc != 0))
 
     def _meanMatrix(idx=None):
         #weighted-mean correlation matrix with vacuum subtraction;
@@ -492,10 +578,12 @@ def interpGEVPStats(modelObj: schwingerModel, ops, burnIn=1, autocorrSkip=1, num
             bootstrap_means[start + s] = _gevpEigs(C_chunk[s])
         del C_chunk
 
-    low  = np.percentile(bootstrap_means, 2.5,  axis=0)
-    high = np.percentile(bootstrap_means, 97.5, axis=0)
+    #nan-aware statistics: a resample with a near-singular reference matrix
+    #yields nan eigenvalues (see gevp) and must not poison the whole error budget
+    low  = np.nanpercentile(bootstrap_means, 2.5,  axis=0)
+    high = np.nanpercentile(bootstrap_means, 97.5, axis=0)
 
-    covMat = np.array([np.cov(bootstrap_means[:, :, eigIdx], rowvar=False) for eigIdx in range(nOps)])
+    covMat = np.array([_finiteCov(bootstrap_means[:, :, eigIdx]) for eigIdx in range(nOps)])
 
     return [totalCorrelMean, np.array([high - totalCorrelMean, totalCorrelMean - low]), covMat, refVecs]
 
@@ -634,6 +722,12 @@ def correlMassExtract(correlStatsOut, fitT=[1,10],diagCov=False):
     return np.array([fitMass[0][0], np.sqrt(fitMass[1][0, 0])])
 
 
+def _finiteCov(samples):
+    """Covariance over bootstrap samples (rows), dropping rows with non-finite entries."""
+    finite = samples[np.all(np.isfinite(samples), axis=1)]
+    return np.cov(finite, rowvar=False)
+
+
 def _discCorrelPair(loopCorrel, loopsSnk, loopsSrc, w):
     """
     Vacuum-subtracted disconnected correlator from two (possibly different) loops.
@@ -749,11 +843,11 @@ def distillGEVPStats(modelObj: schwingerModel, ops=None, flavorTerms=wick.PION_P
             bootstrap_means[start + s] = _gevpEigs(C_chunk[s])
         del C_chunk
 
-    low  = np.percentile(bootstrap_means, 2.5,  axis=0)           # (dimt-ti, nOps)
-    high = np.percentile(bootstrap_means, 97.5, axis=0)
+    low  = np.nanpercentile(bootstrap_means, 2.5,  axis=0)        # (dimtEff-ti, nOps)
+    high = np.nanpercentile(bootstrap_means, 97.5, axis=0)
 
-    # Per-eigenvalue covariance: (nOps, dimt-ti, dimt-ti)
-    covMat = np.array([np.cov(bootstrap_means[:, :, eigIdx], rowvar=False) for eigIdx in range(nOps)])
+    # Per-eigenvalue covariance: (nOps, dimtEff-ti, dimtEff-ti)
+    covMat = np.array([_finiteCov(bootstrap_means[:, :, eigIdx]) for eigIdx in range(nOps)])
 
     return [totalCorrelMean, np.array([high - totalCorrelMean, totalCorrelMean - low]), covMat, refVecs]
 

@@ -285,13 +285,19 @@ def gevp(corrMat, ti=1, refT=None):
 
     def _normalizedEig(t):
         evals, evecs = eig(a=corrMat[:, :, t], b=ref)
+        #a near-singular reference produces inf/nan eigenpairs -- flag them so
+        #they never win the overlap assignment or reach the fits as huge numbers
+        bad = ~np.isfinite(evals)
+        evals = np.where(bad, np.nan, evals)
+        evecs[:, bad] = 0
         #normalize in the C(ti) metric so overlaps are comparable
         norms = np.sqrt(np.abs(np.einsum('ai,ab,bi->i', evecs.conj(), ref, evecs)))
+        norms[~np.isfinite(norms) | (norms == 0)] = np.inf
         return evals, evecs/norms
 
     #reference solve defines the state labels
     evalsR, evecsR = _normalizedEig(refT)
-    order = np.argsort(np.real(evalsR))[::-1]
+    order = np.argsort(np.nan_to_num(np.real(evalsR), nan=-np.inf))[::-1]
     evecsR = evecsR[:, order]
 
     newCorr = np.zeros((dimt - ti, n))
@@ -299,6 +305,7 @@ def gevp(corrMat, ti=1, refT=None):
         evals, evecs = _normalizedEig(t)
         #assign each state the eigenvalue whose eigenvector it overlaps most
         overlap = np.abs(evecsR.conj().T @ ref @ evecs)   # (state, eigenvalue)
+        overlap = np.nan_to_num(overlap, nan=0.0, posinf=0.0, neginf=0.0)
         _, col = linear_sum_assignment(-overlap)
         newCorr[t - ti] = np.real(evals)[col]
 
