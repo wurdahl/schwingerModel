@@ -216,10 +216,19 @@ class distillationSpace:
         if self.cacheDir is None:
             return None
         path = os.path.join(self.cacheDir, fname)
-        return np.load(path) if os.path.exists(path) else None
+        if not os.path.exists(path):
+            return None
+        arr = np.load(path)
+        #never trust a cache file with non-finite entries (transient corruption
+        #under sustained parallel load has been observed to poison the cache):
+        #purge it so the caller recomputes and re-saves a clean copy
+        if not np.all(np.isfinite(arr)):
+            os.remove(path)
+            return None
+        return arr
 
     def _diskSave(self, fname, arr):
-        if self.cacheDir is not None:
+        if self.cacheDir is not None and np.all(np.isfinite(arr)):
             np.save(os.path.join(self.cacheDir, fname), arr)
 
     def eigenBasis(self, configIndex):
