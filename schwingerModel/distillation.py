@@ -403,7 +403,7 @@ def getInterpCorrelMatrix(modelObj: schwingerModel, configIndex: int, numVecs: i
 
 def interpGEVPStats(modelObj: schwingerModel, ops, burnIn=1, autocorrSkip=1, numVecs=4,
                     chemicalPot=0, theta=0, ti=1, numResamples=2000,
-                    vacuumSubtract=True, n_jobs=-1):
+                    vacuumSubtract=True, thermalShift=False, n_jobs=-1):
     """
     Distillation GEVP over a basis of general interpOps (single mesons with any
     gamma / derivative kernel / momentum, and multi-meson operators) that share
@@ -411,10 +411,18 @@ def interpGEVPStats(modelObj: schwingerModel, ops, burnIn=1, autocorrSkip=1, num
     disconnected, and the box/triangle diagrams of multi-particle operators --
     are generated automatically by the permutation method.
 
-    Returns [mean (dimt-ti, nOps), errors (2, dimt-ti, nOps), covMat (nOps, dimt-ti, dimt-ti),
-    refVecs (nOps, nOps)], compatible with correlation.gevpMassExtract.
-    refVecs column k is state k's eigenvector: its operator content in the basis
-    (normalized in the C(ti) metric).
+    thermalShift: if True, the GEVP is solved on the shifted matrix
+        Ctilde(t) = C(t) - C(t+1)
+    which removes time-constant thermal (around-the-world) contamination, e.g.
+    the pi(fwd)pi(bwd) piece of two-pion correlators. The eigenvalue correlators
+    then decay as pure exponentials -- fit with an exp, not a cosh -- and the
+    time extent of the output shrinks by one.
+
+    Returns [mean (dimtEff-ti, nOps), errors (2, dimtEff-ti, nOps),
+    covMat (nOps, dimtEff-ti, dimtEff-ti), refVecs (nOps, nOps)] with
+    dimtEff = dimt-1 if thermalShift else dimt, compatible with
+    correlation.gevpMassExtract. refVecs column k is state k's eigenvector:
+    its operator content in the basis (normalized in the C(ti) metric).
     """
     from .correlation import gevp
 
@@ -456,8 +464,10 @@ def interpGEVPStats(modelObj: schwingerModel, ops, burnIn=1, autocorrSkip=1, num
         return Cm
 
     def _gevpEigs(Cm, returnVecs=False):
-        # Cm: (nOps, nOps, dimt) -> state-tracked eigenvalue correlators (dimt-ti, nOps)
+        # Cm: (nOps, nOps, dimt) -> state-tracked eigenvalue correlators (dimtEff-ti, nOps)
         corrMat = np.real((Cm + np.conj(np.swapaxes(Cm, 0, 1)))/2)  #hermitize
+        if thermalShift:
+            corrMat = corrMat[:, :, :-1] - corrMat[:, :, 1:]
         newCorrs, refVecs = gevp(corrMat, ti=ti)
         if returnVecs:
             return np.real(newCorrs), refVecs
@@ -465,11 +475,13 @@ def interpGEVPStats(modelObj: schwingerModel, ops, burnIn=1, autocorrSkip=1, num
 
     totalCorrelMean, refVecs = _gevpEigs(_meanMatrix(), returnVecs=True)
 
+    dimtEff = dimt - 1 if thermalShift else dimt
+
     #chunked bootstrap over configurations
     chunk_size = 500
     rng = np.random.default_rng()
 
-    bootstrap_means = np.empty((numResamples, dimt - ti, nOps))
+    bootstrap_means = np.empty((numResamples, dimtEff - ti, nOps))
 
     for start in range(0, numResamples, chunk_size):
         end = min(start + chunk_size, numResamples)
@@ -643,7 +655,7 @@ def _discCorrelPair(loopCorrel, loopsSnk, loopsSrc, w):
 
 def distillGEVPStats(modelObj: schwingerModel, ops=None, flavorTerms=wick.PION_PLUS,
                      burnIn=1, autocorrSkip=1, numVecs=4, chemicalPot=0, theta=0,
-                     ti=1, numResamples=2000, n_jobs=-1):
+                     ti=1, numResamples=2000, thermalShift=False, n_jobs=-1):
     """
     Distillation GEVP over a basis of mesonOps (different gammas / covariant
     derivatives): builds the full correlation matrix C_ij(t) = <O_i(t) O_j(0)^dag>
@@ -709,20 +721,24 @@ def distillGEVPStats(modelObj: schwingerModel, ops=None, flavorTerms=wick.PION_P
         return C
 
     def _gevpEigs(C, returnVecs=False):
-        # C: (nOps, nOps, dimt) -> state-tracked eigenvalue correlators (dimt-ti, nOps)
+        # C: (nOps, nOps, dimt) -> state-tracked eigenvalue correlators (dimtEff-ti, nOps)
         corrMat = np.real((C + np.conj(np.swapaxes(C, 0, 1)))/2)  #hermitize
+        if thermalShift:
+            corrMat = corrMat[:, :, :-1] - corrMat[:, :, 1:]
         newCorrs, refVecs = gevp(corrMat, ti=ti)
         if returnVecs:
             return np.real(newCorrs), refVecs
         return np.real(newCorrs)
 
-    totalCorrelMean, refVecs = _gevpEigs(_meanMatrix(), returnVecs=True)  # (dimt-ti, nOps)
+    totalCorrelMean, refVecs = _gevpEigs(_meanMatrix(), returnVecs=True)  # (dimtEff-ti, nOps)
+
+    dimtEff = dimt - 1 if thermalShift else dimt
 
     #chunked bootstrap over configurations
     chunk_size = 500
     rng = np.random.default_rng()
 
-    bootstrap_means = np.empty((numResamples, dimt - ti, nOps))
+    bootstrap_means = np.empty((numResamples, dimtEff - ti, nOps))
 
     for start in range(0, numResamples, chunk_size):
         end = min(start + chunk_size, numResamples)
