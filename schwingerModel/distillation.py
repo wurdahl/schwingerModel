@@ -411,8 +411,10 @@ def interpGEVPStats(modelObj: schwingerModel, ops, burnIn=1, autocorrSkip=1, num
     disconnected, and the box/triangle diagrams of multi-particle operators --
     are generated automatically by the permutation method.
 
-    Returns [mean (dimt-ti, nOps), errors (2, dimt-ti, nOps), covMat (nOps, dimt-ti, dimt-ti)],
-    compatible with correlation.gevpMassExtract.
+    Returns [mean (dimt-ti, nOps), errors (2, dimt-ti, nOps), covMat (nOps, dimt-ti, dimt-ti),
+    refVecs (nOps, nOps)], compatible with correlation.gevpMassExtract.
+    refVecs column k is state k's eigenvector: its operator content in the basis
+    (normalized in the C(ti) metric).
     """
     from .correlation import gevp
 
@@ -453,13 +455,15 @@ def interpGEVPStats(modelObj: schwingerModel, ops, burnIn=1, autocorrSkip=1, num
             Cm = Cm - vac
         return Cm
 
-    def _gevpEigs(Cm):
-        # Cm: (nOps, nOps, dimt) -> sorted eigenvalue correlators (dimt-ti, nOps)
+    def _gevpEigs(Cm, returnVecs=False):
+        # Cm: (nOps, nOps, dimt) -> state-tracked eigenvalue correlators (dimt-ti, nOps)
         corrMat = np.real((Cm + np.conj(np.swapaxes(Cm, 0, 1)))/2)  #hermitize
-        newCorrs, _ = gevp(corrMat, ti=ti)
+        newCorrs, refVecs = gevp(corrMat, ti=ti)
+        if returnVecs:
+            return np.real(newCorrs), refVecs
         return np.real(newCorrs)
 
-    totalCorrelMean = _gevpEigs(_meanMatrix())
+    totalCorrelMean, refVecs = _gevpEigs(_meanMatrix(), returnVecs=True)
 
     #chunked bootstrap over configurations
     chunk_size = 500
@@ -481,7 +485,7 @@ def interpGEVPStats(modelObj: schwingerModel, ops, burnIn=1, autocorrSkip=1, num
 
     covMat = np.array([np.cov(bootstrap_means[:, :, eigIdx], rowvar=False) for eigIdx in range(nOps)])
 
-    return [totalCorrelMean, np.array([high - totalCorrelMean, totalCorrelMean - low]), covMat]
+    return [totalCorrelMean, np.array([high - totalCorrelMean, totalCorrelMean - low]), covMat, refVecs]
 
 def getCorrelation(modelObj: schwingerModel, configIndex: int, numVecs: int, chemicalPot=0,
                     gamma=np.array([[1j,0],[0,-1j]])):
@@ -647,8 +651,9 @@ def distillGEVPStats(modelObj: schwingerModel, ops=None, flavorTerms=wick.PION_P
     (wick.PION_PLUS / PION_ZERO: connected only, wick.ETA: connected + 2x disc.),
     then solves the GEVP on the ensemble mean and on each bootstrap resample.
 
-    Returns [mean (dimt-ti, nOps), errors (2, dimt-ti, nOps), covMat (nOps, dimt-ti, dimt-ti)],
-    compatible with correlation.gevpMassExtract.
+    Returns [mean (dimt-ti, nOps), errors (2, dimt-ti, nOps), covMat (nOps, dimt-ti, dimt-ti),
+    refVecs (nOps, nOps)], compatible with correlation.gevpMassExtract.
+    refVecs column k is state k's eigenvector: its operator content in the basis.
     """
     from .correlation import gevp
 
@@ -703,13 +708,15 @@ def distillGEVPStats(modelObj: schwingerModel, ops=None, flavorTerms=wick.PION_P
                         lC[..., :, i, j, :], lS[..., :, i, :], lB[..., :, j, :], w)
         return C
 
-    def _gevpEigs(C):
-        # C: (nOps, nOps, dimt) -> sorted eigenvalue correlators (dimt-ti, nOps)
+    def _gevpEigs(C, returnVecs=False):
+        # C: (nOps, nOps, dimt) -> state-tracked eigenvalue correlators (dimt-ti, nOps)
         corrMat = np.real((C + np.conj(np.swapaxes(C, 0, 1)))/2)  #hermitize
-        newCorrs, _ = gevp(corrMat, ti=ti)
+        newCorrs, refVecs = gevp(corrMat, ti=ti)
+        if returnVecs:
+            return np.real(newCorrs), refVecs
         return np.real(newCorrs)
 
-    totalCorrelMean = _gevpEigs(_meanMatrix())                    # (dimt-ti, nOps)
+    totalCorrelMean, refVecs = _gevpEigs(_meanMatrix(), returnVecs=True)  # (dimt-ti, nOps)
 
     #chunked bootstrap over configurations
     chunk_size = 500
@@ -732,6 +739,6 @@ def distillGEVPStats(modelObj: schwingerModel, ops=None, flavorTerms=wick.PION_P
     # Per-eigenvalue covariance: (nOps, dimt-ti, dimt-ti)
     covMat = np.array([np.cov(bootstrap_means[:, :, eigIdx], rowvar=False) for eigIdx in range(nOps)])
 
-    return [totalCorrelMean, np.array([high - totalCorrelMean, totalCorrelMean - low]), covMat]
+    return [totalCorrelMean, np.array([high - totalCorrelMean, totalCorrelMean - low]), covMat, refVecs]
 
 
