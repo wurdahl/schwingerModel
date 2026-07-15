@@ -3,3 +3,4 @@ from . import analysis
 from . import buildOps
 from . import correlation
 from . import distillation
+from . import wick
