@@ -465,10 +465,26 @@ def computeInterpCorrelData(modelObj: schwingerModel, ops, burnIn=1, autocorrSki
                                            chemicalPot=chemicalPot, cacheDir=cacheDir)
             for i in indices)
 
+    C      = np.array([r[0] for r in perConfig])  # (n_configs, nOps, nOps, dimt)
+    vevSnk = np.array([r[1] for r in perConfig])  # (n_configs, nOps, dimt)
+    vevSrc = np.array([r[2] for r in perConfig])
+
+    #guard against transient numerical corruption in the parallel workers
+    #(observed once as ~1e298 entries with clean inputs): recompute any config
+    #whose matrix is non-finite or absurdly large, and fail loudly if it persists
+    def _invalid(c):
+        return not np.all(np.isfinite(c)) or np.max(np.abs(c)) > 1e10
+    for n in range(len(indices)):
+        if _invalid(C[n]):
+            print(f"config {indices[n]}: corrupted correlation matrix, recomputing")
+            redo = getInterpCorrelMatrix(modelObj, int(indices[n]), numVecs, ops,
+                                         chemicalPot=chemicalPot, cacheDir=cacheDir)
+            if _invalid(redo[0]):
+                raise RuntimeError(f"config {indices[n]}: correlation matrix invalid after recompute")
+            C[n], vevSnk[n], vevSrc[n] = redo
+
     return {
-        'C':      np.array([r[0] for r in perConfig]),  # (n_configs, nOps, nOps, dimt)
-        'vevSnk': np.array([r[1] for r in perConfig]),  # (n_configs, nOps, dimt)
-        'vevSrc': np.array([r[2] for r in perConfig]),
+        'C': C, 'vevSnk': vevSnk, 'vevSrc': vevSrc,
         'indices': indices,
         'burnIn': burnIn, 'autocorrSkip': autocorrSkip,
         'numVecs': numVecs, 'chemicalPot': chemicalPot,
