@@ -260,20 +260,49 @@ def GEVPStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
     return [totalCorrelMean, np.array([high - totalCorrelMean, totalCorrelMean - low]), covMat]
 
     
-def gevp(corrMat, ti=1):
+def gevp(corrMat, ti=1, refT=None):
     """
     corrMat: (n, n, dimt) symmetric correlation matrix.
-    Returns newCorr (dimt-ti, n) eigenvalues sorted descending and basis averaged over t.
+    Solves C(t) v = lambda C(ti) v for every t >= ti.
+
+    States are labelled by their EIGENVECTORS, not by per-timeslice magnitude
+    sorting: a reference solve at refT (default ti+1) defines the states (sorted
+    descending there), and at every other t each eigenvalue is assigned to the
+    state whose reference eigenvector it overlaps most in the C(ti) metric.
+    This keeps a state's correlator on one curve even when eigenvalue curves
+    cross (e.g. backward cosh branches or noise at large t).
+
+    Returns newCorr (dimt-ti, n) and the reference eigenvectors (n, n) whose
+    columns give each state's operator content.
     """
+    from scipy.optimize import linear_sum_assignment
+
+    n = corrMat.shape[0]
     dimt = corrMat.shape[2]
     ref = corrMat[:, :, ti]
+    if refT is None:
+        refT = ti + 1
 
-    gevpOutput = [eig(a=corrMat[:, :, t], b=ref) for t in range(ti, dimt)]
+    def _normalizedEig(t):
+        evals, evecs = eig(a=corrMat[:, :, t], b=ref)
+        #normalize in the C(ti) metric so overlaps are comparable
+        norms = np.sqrt(np.abs(np.einsum('ai,ab,bi->i', evecs.conj(), ref, evecs)))
+        return evals, evecs/norms
 
-    newCorr = np.array([np.sort(np.real(ev[0]))[::-1] for ev in gevpOutput])
-    basis = np.mean([ev[1] for ev in gevpOutput], axis=0)
+    #reference solve defines the state labels
+    evalsR, evecsR = _normalizedEig(refT)
+    order = np.argsort(np.real(evalsR))[::-1]
+    evecsR = evecsR[:, order]
 
-    return newCorr, basis
+    newCorr = np.zeros((dimt - ti, n))
+    for t in range(ti, dimt):
+        evals, evecs = _normalizedEig(t)
+        #assign each state the eigenvalue whose eigenvector it overlaps most
+        overlap = np.abs(evecsR.conj().T @ ref @ evecs)   # (state, eigenvalue)
+        _, col = linear_sum_assignment(-overlap)
+        newCorr[t - ti] = np.real(evals)[col]
+
+    return newCorr, evecsR
 
 def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
     """
