@@ -4,3 +4,4 @@ from . import buildOps
 from . import correlation
 from . import distillation
 from . import wick
+from . import theory
