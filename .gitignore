@@ -2,3 +2,4 @@
 distillCache
 *.hdf5
 *.pyc
+configs
