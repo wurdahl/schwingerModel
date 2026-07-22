@@ -50,6 +50,33 @@ def buildDiracOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
 
     return Dee
 
+def applyCovDerivative(modelObj, gaugeLinks, fields):
+    """Symmetric covariant derivative on fields of shape (N_t, N_x, N_vec)."""
+    U  = gaugeLinks[:, :, 1].T[:, :, None]                    # (N_t, N_x, 1)
+    Um = np.roll(np.conj(U), 1, axis=1)                       # U*_{x-1}
+    return (U * np.roll(fields, -1, axis=1)
+            - Um * np.roll(fields, 1, axis=1)) / (2 * modelObj.a)
+
+
+def buildLaplacian(modelObj: schwingerModel, gaugeLinks, nt):
+    """
+    Creates the gauge-covariant laplacian at time slice nt (no spin index)
+    """
+
+    #dirac dimensions
+
+    shift_x_1Dpos = np.roll(np.eye(modelObj.dimx), -1, axis=0) # This is \delta_{x_n+1, x_m}
+    shift_x_1Dneg = np.roll(np.eye(modelObj.dimx), +1, axis=0) # This is \delta_{x_n+1, x_m}
+
+    #flattened gaugelinks: [:,nt, 1] are spatial links at timeslice t
+    spaceLinks = sparse.diags_array(gaugeLinks[:,nt,1].flatten())
+
+    #H matrix for smearing
+    H = spaceLinks@shift_x_1Dpos + shift_x_1Dneg@np.conj(spaceLinks)
+    #subtract off diagonal
+    H-= 2*sparse.eye_array(modelObj.dimx)
+
+    return H
 
 def buildNumberDensOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
     #dirac dimensions
