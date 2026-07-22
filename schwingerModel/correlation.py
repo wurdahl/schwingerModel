@@ -2,6 +2,7 @@ import numpy as np
 import scipy.sparse as sparse
 from scipy.stats import bootstrap
 from scipy.optimize import curve_fit
+from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 from scipy.linalg import eig
 from scipy.sparse.linalg import splu
@@ -260,20 +261,56 @@ def GEVPStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
     return [totalCorrelMean, np.array([high - totalCorrelMean, totalCorrelMean - low]), covMat]
 
     
-def gevp(corrMat, ti=1):
+def gevp(corrMat, ti=1, sortBy="vector", refVecs=None):
     """
     corrMat: (n, n, dimt) symmetric correlation matrix.
-    Returns newCorr (dimt-ti, n) eigenvalues sorted descending and basis averaged over t.
+    Returns newCorr (dimt-ti, n) eigenvalue curves and the reference eigenvectors.
+
+    sortBy="value":  order eigenvalues descending at each t independently (old behavior;
+                     mis-assigns states where curves approach or cross).
+    sortBy="vector": track states across t by eigenvector overlap in the C(ti) metric —
+                     GEVP eigenvectors are C(ti)-orthogonal, so |v_ref^dag C(ti) v(t)|
+                     identifies which physical state each eigenpair belongs to.
+                     State labels are fixed by descending eigenvalue at t = ti+1.
     """
     dimt = corrMat.shape[2]
+    n = corrMat.shape[0]
     ref = corrMat[:, :, ti]
 
     gevpOutput = [eig(a=corrMat[:, :, t], b=ref) for t in range(ti, dimt)]
 
-    newCorr = np.array([np.sort(np.real(ev[0]))[::-1] for ev in gevpOutput])
-    basis = np.mean([ev[1] for ev in gevpOutput], axis=0)
+    if sortBy == "value":
+        newCorr = np.array([np.sort(np.real(ev[0]))[::-1] for ev in gevpOutput])
+        basis = np.mean([ev[1] for ev in gevpOutput], axis=0)
+        return newCorr, basis
 
-    return newCorr, basis
+    def _refNormalize(v):
+        # normalize columns in the C(ti) metric; guard vanishing norms (noise)
+        nrm = np.sqrt(np.abs(np.einsum('im,ij,jm->m', v.conj(), ref, v)))
+        nrm[nrm == 0] = 1.0
+        return v / nrm
+
+    if refVecs is not None:
+        # external anchor (e.g. the ensemble-central eigenvectors): keeps state labels
+        # consistent across bootstrap resamples instead of re-deriving them per sample
+        vRef = _refNormalize(np.asarray(refVecs))
+    else:
+        # reference eigenvectors: at t=ti all eigenvalues are trivially 1, so label
+        # states at the first nontrivial time slice, ordered by descending eigenvalue
+        refIdx = 1 if len(gevpOutput) > 1 else 0
+        w0, v0 = gevpOutput[refIdx]
+        order0 = np.argsort(np.real(w0))[::-1]
+        vRef = _refNormalize(v0[:, order0])
+
+    newCorr = np.empty((len(gevpOutput), n))
+    for k, (w, v) in enumerate(gevpOutput):
+        v = _refNormalize(v)
+        overlap = np.abs(vRef.conj().T @ ref @ v)          # (state, eigenpair)
+        rows, cols = linear_sum_assignment(-overlap)        # maximize total overlap
+        assign = cols[np.argsort(rows)]                     # eigenpair for each state
+        newCorr[k] = np.real(w[assign])
+
+    return newCorr, vRef
 
 def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
     """

@@ -413,3 +413,21 @@ def generateDistillFile(modelObj: schwingerModel, filePath, numVecs, burnIn=0, a
                 grp.create_dataset(key, data=arr)
 
     return filePath
+
+
+def readDistillMeta(filePath):
+    """
+    File-level metadata and inventory of a generateDistillFile cache, so notebooks
+    never need the schwingerModel pickle. Returns a SimpleNamespace with the stored
+    attrs (dimx, dimt, a, fMass, numVecs, gammat, gammax, version) plus:
+      configIndices : sorted list of stored config indices
+      elemKeys      : sorted list of stored (momk, DNum) elemental keys
+    """
+    with h5py.File(filePath, "r") as f:
+        meta = SimpleNamespace(**{k: f.attrs[k] for k in f.attrs})
+        meta.dimx, meta.dimt = int(meta.dimx), int(meta.dimt)
+        meta.numVecs = int(meta.numVecs)
+        meta.configIndices = sorted(int(name[3:]) for name in f if name.startswith("cfg"))
+        first = f[f"cfg{meta.configIndices[0]:05d}"]
+        meta.elemKeys = sorted(_parseElemKey(k) for k in first["elem"])
+    return meta

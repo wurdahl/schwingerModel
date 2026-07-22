@@ -19,15 +19,37 @@ def measureEnsemble2pt(filePath, configIndices, basis, n_jobs=-1):
 
     return np.array(correls)
 
-def gevpReduce(Cmean, ti=1):
+def gevpReduce(Cmean, ti=1, refVecs=None):
     """
     Reduce one (n, n, T) mean correlation matrix to GEVP eigenvalue curves (T-ti, n).
     Symmetrization happens here, explicitly, on the ensemble/resample mean —
     per-config matrices are NOT hermitian, only their average is.
     """
     Csym = 0.5 * (Cmean + np.conj(np.transpose(Cmean, (1, 0, 2))))
-    newCorr, _ = gevp(np.real(Csym), ti=ti)
+    newCorr, _ = gevp(np.real(Csym), ti=ti, refVecs=refVecs)
     return newCorr
+
+
+def makeGevpReduce(ti=1):
+    """
+    Stateful gevpReduce for bootstrapping: the FIRST call (which bootstrapEnsemble2pt
+    makes on the full-ensemble central mean) fixes the reference eigenvectors, and every
+    subsequent call (the resamples) labels its states against that anchor. This prevents
+    state labels from flipping between resamples when eigenvalues are close — the cause
+    of bimodal bootstrap distributions and central values outside the percentile band.
+    Create a fresh instance per bootstrapEnsemble2pt call.
+    """
+    state = {}
+
+    def _reduce(Cmean):
+        Csym = 0.5 * (Cmean + np.conj(np.transpose(Cmean, (1, 0, 2))))
+        if "vRef" not in state:
+            curves, vRef = gevp(np.real(Csym), ti=ti)
+            state["vRef"] = vRef
+            return curves
+        return gevp(np.real(Csym), ti=ti, refVecs=state["vRef"])[0]
+
+    return _reduce
 
 
 def bootstrapEnsemble2pt(correls, weights=None, reduce=None, numResamples=10000, seed=None):
