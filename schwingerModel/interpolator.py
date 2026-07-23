@@ -57,7 +57,7 @@ class Bilinear(NamedTuple):
     def __str__(self):
         tags = []
         if self.op.DNum: tags.append(f"D{self.op.DNum}")
-        if self.op.momk: tags.append(f"k{self.op.momk:+d}")
+        if self.op.momk: tags.append(f"k={self.op.momk:+d}")
         tag = "," + ",".join(tags) if tags else ""
         barMark = "~" if self.bar else ""
         return f"{self.aq}_bar {self.op.gamma}{barMark}{tag} {self.q}"

@@ -158,7 +158,7 @@ def formatTable(table):
             steps = []
             for (label, op, bar), fl in cyc:
                 tags = "".join([f",D{op.DNum}" if op.DNum else "",
-                                f",k{op.momk:+d}" if op.momk else ""])
+                                f",k={op.momk:+d}" if op.momk else ""])
                 steps.append(f"{label}:{op.gamma}{'~' if bar else ''}{tags} --{fl}-->")
             cycs.append("Tr[ " + " ".join(steps) + " ]")
         lines.append(f"{coeff:+.4g}  " + "  x  ".join(cycs))
