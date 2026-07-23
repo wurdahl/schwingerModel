@@ -9,9 +9,10 @@ from tqdm.auto import tqdm
 from joblib import Parallel, delayed
 import joblib
 import contextlib
-from typing import NamedTuple
 from types import SimpleNamespace
 import h5py
+
+from .interpolator import MesonOp
 
 @contextlib.contextmanager
 def tqdm_joblib(tqdm_object):
@@ -33,15 +34,10 @@ if TYPE_CHECKING:
     from .schwingerModel import schwingerModel
 
 from . import buildOps as ops
-from .analysis import getWeightingFactorsTheta
+from .reweighting import getWeightingFactorsTheta
 
 GAMMAS = {"g5":np.array([[1j,0],[0,-1j]]),"gx":np.array([[0,1],[1,0]]),
           "gt":np.array([[0,-1j],[1j,0]]), "id":np.eye(2)}
-
-class MesonOp(NamedTuple):
-    gamma:str
-    DNum: int=0
-    momk: int=0
 
 def findPartialEigenBasis(modelObj: schwingerModel, configIndex = 0, numVecs = 4):
 
@@ -386,7 +382,8 @@ def generateDistillFile(modelObj: schwingerModel, filePath, numVecs, burnIn=0, a
     indices = [int(i) for i in np.arange(burnIn, modelObj.metroSteps, autocorrSkip)]
 
     meta = {"dimx": modelObj.dimx, "dimt": modelObj.dimt, "a": modelObj.a,
-            "fMass": modelObj.fMass, "numVecs": numVecs, "version": 1}
+            "fMass": modelObj.fMass, "beta": modelObj.beta,
+            "numVecs": numVecs, "version": 1}
 
     with h5py.File(filePath, "a") as f:
         for key, val in meta.items():

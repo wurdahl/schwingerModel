@@ -13,6 +13,8 @@ from contextlib import contextmanager
 from .schwingerModel import schwingerModel
 from . import buildOps as ops
 from . import analysis
+from . import reweighting
+from .GEVP import gevp
 
 
 @contextmanager
@@ -113,7 +115,7 @@ def correlStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
     acceptedCorrel_conn = []
 
     #weights for chemicalPot
-    weightsMu = analysis.getWeightingFactors(modelObj, 0, burnIn,  autocorrSkip)
+    weightsMu = reweighting.getWeightingFactors(modelObj, 0, burnIn,  autocorrSkip)
 
     #if k!=0, then each config will show up twice, so we need to repeat the weights
     if(momk!=0):
@@ -195,7 +197,7 @@ def GEVPStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
                     kappas=[.1,0], smearNs=[1,0],
                     momk=0, ti=1, saveProps=True, n_jobs=-1):
 
-    weightsMu = analysis.getWeightingFactors(modelObj, 0, burnIn, autocorrSkip)
+    weightsMu = reweighting.getWeightingFactors(modelObj, 0, burnIn, autocorrSkip)
 
     if momk != 0:
         weightsMu = np.repeat(weightsMu, 2)
@@ -259,89 +261,3 @@ def GEVPStats(modelObj: schwingerModel, burnIn=1, autocorrSkip=1,
     totalCorrelMean = np.real(np.average(totalCorrels, axis=0, weights=weightsMu))  # (dimt-ti, n)
 
     return [totalCorrelMean, np.array([high - totalCorrelMean, totalCorrelMean - low]), covMat]
-
-    
-def gevp(corrMat, ti=1, sortBy="vector", refVecs=None):
-    """
-    corrMat: (n, n, dimt) symmetric correlation matrix.
-    Returns newCorr (dimt-ti, n) eigenvalue curves and the reference eigenvectors.
-
-    sortBy="value":  order eigenvalues descending at each t independently (old behavior;
-                     mis-assigns states where curves approach or cross).
-    sortBy="vector": track states across t by eigenvector overlap in the C(ti) metric —
-                     GEVP eigenvectors are C(ti)-orthogonal, so |v_ref^dag C(ti) v(t)|
-                     identifies which physical state each eigenpair belongs to.
-                     State labels are fixed by descending eigenvalue at t = ti+1.
-    """
-    dimt = corrMat.shape[2]
-    n = corrMat.shape[0]
-    ref = corrMat[:, :, ti]
-
-    gevpOutput = [eig(a=corrMat[:, :, t], b=ref) for t in range(ti, dimt)]
-
-    if sortBy == "value":
-        newCorr = np.array([np.sort(np.real(ev[0]))[::-1] for ev in gevpOutput])
-        basis = np.mean([ev[1] for ev in gevpOutput], axis=0)
-        return newCorr, basis
-
-    def _refNormalize(v):
-        # normalize columns in the C(ti) metric; guard vanishing norms (noise)
-        nrm = np.sqrt(np.abs(np.einsum('im,ij,jm->m', v.conj(), ref, v)))
-        nrm[nrm == 0] = 1.0
-        return v / nrm
-
-    if refVecs is not None:
-        # external anchor (e.g. the ensemble-central eigenvectors): keeps state labels
-        # consistent across bootstrap resamples instead of re-deriving them per sample
-        vRef = _refNormalize(np.asarray(refVecs))
-    else:
-        # reference eigenvectors: at t=ti all eigenvalues are trivially 1, so label
-        # states at the first nontrivial time slice, ordered by descending eigenvalue
-        refIdx = 1 if len(gevpOutput) > 1 else 0
-        w0, v0 = gevpOutput[refIdx]
-        order0 = np.argsort(np.real(w0))[::-1]
-        vRef = _refNormalize(v0[:, order0])
-
-    newCorr = np.empty((len(gevpOutput), n))
-    for k, (w, v) in enumerate(gevpOutput):
-        v = _refNormalize(v)
-        overlap = np.abs(vRef.conj().T @ ref @ v)          # (state, eigenpair)
-        rows, cols = linear_sum_assignment(-overlap)        # maximize total overlap
-        assign = cols[np.argsort(rows)]                     # eigenpair for each state
-        newCorr[k] = np.real(w[assign])
-
-    return newCorr, vRef
-
-def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
-    """
-    gevpStatsOut: output of GEVPStats — [mean (dimt-ti, n), errors, covMat (n, dimt-ti, dimt-ti)]
-    eigenIdx: which eigenvalue to fit (0 = lowest mass, 1 = next, ...)
-
-    Fits in log space: minimizes relative residuals, giving equal weight per decade.
-    Covariance is propagated as Σ_log[i,j] = Σ_lin[i,j] / (C[i] * C[j]).
-    """
-    dimt = gevpStatsOut[0].shape[0] + ti
-
-    def expDecay_log(nt, Energy):
-        return -nt * Energy
-
-    def coshCorrel_log(nt, Energy):
-        numer = np.logaddexp(-(nt + ti) * Energy, ((nt + ti) - dimt) * Energy)
-        denom = np.logaddexp(-ti * Energy, (ti - dimt) * Energy)
-        return numer - denom
-
-    mean = gevpStatsOut[0][fitT[0]:fitT[1], eigenIdx]
-    cov  = gevpStatsOut[2][eigenIdx, fitT[0]:fitT[1], fitT[0]:fitT[1]]
-
-    log_mean = np.log(mean)
-    inv_mean = 1.0 / mean
-    log_cov  = cov * np.outer(inv_mean, inv_mean)
-
-    if coshExpr:
-        fitMass = curve_fit(coshCorrel_log, xdata=np.arange(fitT[0], fitT[1]),
-                    ydata=log_mean, sigma=log_cov, absolute_sigma=True, bounds=(0, np.inf))
-    else:
-        fitMass = curve_fit(expDecay_log, xdata=np.arange(fitT[0], fitT[1]),
-                    ydata=log_mean, sigma=log_cov, absolute_sigma=True, bounds=(0, np.inf))
-
-    return np.array([fitMass[0][0], np.sqrt(fitMass[1][0, 0])])
