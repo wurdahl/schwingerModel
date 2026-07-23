@@ -86,6 +86,32 @@ def applyA(theta, psi, fMass, a):
     return applyD(theta, applyD(theta, psi, fMass, a, dagger=True), fMass, a)
 
 
+def geometricQ(theta):
+    """
+    Geometric topological charge Q = sum_p arg(U_plaq)/2pi. Integer whenever no
+    plaquette angle sits at +-pi, and only changes when one crosses +-pi during
+    the MD evolution -- which is what fixQ rejection tests for. Works on single
+    (dimx, dimt, 2) or batched (..., dimx, dimt, 2) angle arrays.
+    """
+    U = links(theta)
+    Ut, Ux = U[..., 0], U[..., 1]
+    plaq = Ux * jnp.roll(Ut, -1, axis=-2) * jnp.conj(jnp.roll(Ux, -1, axis=-1)) * jnp.conj(Ut)
+    return jnp.sum(jnp.angle(plaq), axis=(-2, -1)) / (2 * jnp.pi)
+
+
+def instantonAngles(dimx, dimt, Q):
+    """
+    Smooth charge-Q background on the torus: every plaquette angle equals
+    2 pi Q / V (admissible for |Q| << V/2), so geometricQ returns exactly Q.
+    Use as theta0 for a sector-frozen run.
+    """
+    V = dimx * dimt
+    theta = np.zeros((dimx, dimt, 2))
+    theta[:, :, 1] = -2 * np.pi * Q * np.arange(dimt)[None, :] / V
+    theta[:, -1, 0] = 2 * np.pi * Q * np.arange(dimx) / dimx
+    return theta
+
+
 def _forceSolve(theta, phi, x0, beta, fMass, a, cgTol, maxiter):
     """
     One CG solve X = (D D^dag)^{-1} phi (warm-started at x0), then the exact HMC
@@ -103,11 +129,16 @@ def _forceSolve(theta, phi, x0, beta, fMass, a, cgTol, maxiter):
     return jax.grad(surrogate)(theta), X
 
 
-def hmcStep(theta, key, beta, fMass, a, subSteps, cgTol, maxiter):
+def hmcStep(theta, key, beta, fMass, a, subSteps, cgTol, maxiter, fixQ=False):
     """
     One HMC trajectory for a single chain (vmap over the leading axis for many).
     Mirrors schwingerModel.hmcStep: pseudofermion heat bath, leapfrog with
     numSubSteps position updates, Metropolis accept/reject on dH.
+
+    fixQ=True additionally rejects any trajectory that changes the geometric
+    topological charge. Sector boundaries are measure-zero, so this samples the
+    SAME Wilson-action measure exactly, restricted to the starting Q sector --
+    the sector weights Z_Q of the unmodified theory are untouched.
     Returns (theta_new, accepted).
     """
     eps = 1.0 / subSteps
@@ -148,6 +179,8 @@ def hmcStep(theta, key, beta, fMass, a, subSteps, cgTol, maxiter):
 
     u = jax.random.uniform(kAcc, (), rdt)
     accept = jnp.isfinite(dH) & (u < jnp.exp(-dH))   # nan dH (CG blowup) -> reject
+    if fixQ:
+        accept = accept & (jnp.round(geometricQ(th)) == jnp.round(geometricQ(theta)))
     thetaNew = jnp.where(accept, th, theta)
     # wrap angles after accept/reject (exact symmetry; keeps floats well-conditioned)
     thetaNew = jnp.mod(thetaNew + jnp.pi, 2 * jnp.pi) - jnp.pi
@@ -156,7 +189,8 @@ def hmcStep(theta, key, beta, fMass, a, subSteps, cgTol, maxiter):
 
 def runEnsemble(dimx, dimt, beta=2.0, fMass=0.2, aSpacing=1.0, nChains=256,
                 nKept=100, thin=1, burnIn=100, subSteps=25, cgTol=1e-5,
-                maxiter=1000, seed=0, start='cold', progress=True):
+                maxiter=1000, seed=0, start='cold', theta0=None, fixQ=False,
+                progress=True):
     """
     Generate a batched ensemble: nChains independent HMC chains advanced together.
 
@@ -167,6 +201,11 @@ def runEnsemble(dimx, dimt, beta=2.0, fMass=0.2, aSpacing=1.0, nChains=256,
     start: 'cold' (all links 1, like the CPU code) or 'hot' (uniform random
     angles). Hot starts give overdispersed initial conditions -- useful for
     topological-sector coverage -- at the cost of longer burn-in.
+
+    theta0: optional initial angle array (dimx, dimt, 2), broadcast to all
+    chains (overrides start) -- e.g. instantonAngles(dimx, dimt, Q). Combine
+    with fixQ=True for a sector-frozen run: trajectories that would change the
+    geometric charge are rejected, so every chain stays at its starting Q.
 
     Precision follows jax's x64 setting: enable it before import for float64.
 
@@ -180,7 +219,7 @@ def runEnsemble(dimx, dimt, beta=2.0, fMass=0.2, aSpacing=1.0, nChains=256,
     chainIdx = jnp.arange(nChains)
 
     step = partial(hmcStep, beta=beta, fMass=fMass, a=aSpacing,
-                   subSteps=subSteps, cgTol=cgTol, maxiter=maxiter)
+                   subSteps=subSteps, cgTol=cgTol, maxiter=maxiter, fixQ=fixQ)
     vStep = jax.vmap(step)
 
     def sweep(carry, _):
@@ -195,7 +234,10 @@ def runEnsemble(dimx, dimt, beta=2.0, fMass=0.2, aSpacing=1.0, nChains=256,
         (th, gStep, accSum), _ = lax.scan(sweep, (th, gStep, accSum), None, length=n)
         return th, gStep, accSum
 
-    if start == 'hot':
+    if theta0 is not None:
+        theta = jnp.broadcast_to(jnp.asarray(theta0, rdt),
+                                 (nChains, dimx, dimt, 2)) + jnp.zeros((), rdt)
+    elif start == 'hot':
         theta = jax.random.uniform(jax.random.fold_in(baseKey, -1),
                                    (nChains, dimx, dimt, 2), rdt,
                                    minval=-jnp.pi, maxval=jnp.pi)

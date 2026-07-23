@@ -9,3 +9,4 @@ try:
     from . import hmcJax
 except ImportError:
     pass
+from . import topology
