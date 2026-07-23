@@ -3,6 +3,7 @@ from joblib import Parallel, delayed
 import joblib
 from scipy.linalg import eig
 from scipy.optimize import curve_fit, linear_sum_assignment
+from tqdm.auto import tqdm
 
 from . import distillation as dist
 from .wick import contract, mergeFlavors
@@ -55,8 +56,9 @@ def measureEnsemble(filePath, configIndices, basis, n_jobs=-1):
     """
     tables = contractBasis(basis)
     n = len(basis)
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(_measureConfigWick)(filePath, i, tables, n) for i in configIndices)
+    with dist.tqdm_joblib(tqdm(total=len(configIndices), desc="Measuring configs")):
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(_measureConfigWick)(filePath, i, tables, n) for i in configIndices)
 
     conn = np.array([r[0] for r in results])
     disc = {}
@@ -88,7 +90,8 @@ def _assembleC(connMean, discMeans):
     return C
 
 
-def bootstrapEnsemble(measured, weights=None, reduce=None, numResamples=10000, seed=None):
+def bootstrapEnsemble(measured, weights=None, reduce=None, numResamples=10000, seed=None,
+                      progress=True):
     """
     Bootstrap statistics for measureEnsemble output, with disc vacuum subtraction
     done per resample (subtraction needs ensemble means, so it lives here).
@@ -127,7 +130,17 @@ def bootstrapEnsemble(measured, weights=None, reduce=None, numResamples=10000, s
     samplesC = _assembleC(rMean(conn), discSamples)
 
     central = np.real(reduce(centralC))
-    samples = np.real(np.array([reduce(c) for c in samplesC]))
+    iterator = tqdm(samplesC, desc="Bootstrap reduce", leave=False) if progress else samplesC
+    samples = np.real(np.array([reduce(c) for c in iterator]))
+
+    # drop resamples where the reduce failed (e.g. massReduce fit window hit
+    # non-positive values) so they don't poison percentiles and covariance
+    valid = ~np.isnan(samples.reshape(len(samples), -1)).any(axis=1)
+    if not valid.all():
+        import warnings
+        warnings.warn(f"bootstrapEnsemble: dropped {(~valid).sum()}/{len(valid)} "
+                      "resamples with NaN reduce output")
+        samples = samples[valid]
 
     low  = np.percentile(samples, 2.5,  axis=0)
     high = np.percentile(samples, 97.5, axis=0)
@@ -206,13 +219,16 @@ def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
     """
     dimt = gevpStatsOut[0].shape[0] + ti
 
-    def expDecay_log(nt, Energy):
-        return -nt * Energy
+    # logA is a free amplitude: the GEVP normalization lambda(ti)=1 is a
+    # convention, and pinning the fit through it pushes excited-state
+    # contamination at ti into the mass. logA != 0 measures that contamination.
+    def expDecay_log(nt, Energy, logA):
+        return logA - nt * Energy
 
-    def coshCorrel_log(nt, Energy):
+    def coshCorrel_log(nt, Energy, logA):
         numer = np.logaddexp(-(nt + ti) * Energy, ((nt + ti) - dimt) * Energy)
         denom = np.logaddexp(-ti * Energy, (ti - dimt) * Energy)
-        return numer - denom
+        return logA + numer - denom
 
     mean = gevpStatsOut[0][fitT[0]:fitT[1], eigenIdx]
     cov  = gevpStatsOut[2][eigenIdx, fitT[0]:fitT[1], fitT[0]:fitT[1]]
@@ -221,14 +237,14 @@ def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
     inv_mean = 1.0 / mean
     log_cov  = cov * np.outer(inv_mean, inv_mean)
 
-    if coshExpr:
-        fitMass = curve_fit(coshCorrel_log, xdata=np.arange(fitT[0], fitT[1]),
-                    ydata=log_mean, sigma=log_cov, absolute_sigma=True, bounds=(0, np.inf))
-    else:
-        fitMass = curve_fit(expDecay_log, xdata=np.arange(fitT[0], fitT[1]),
-                    ydata=log_mean, sigma=log_cov, absolute_sigma=True, bounds=(0, np.inf))
+    model = coshCorrel_log if coshExpr else expDecay_log
+    fitMass = curve_fit(model, xdata=np.arange(fitT[0], fitT[1]),
+                ydata=log_mean, sigma=log_cov, absolute_sigma=True,
+                p0=[0.5, 0.0], bounds=([0, -np.inf], [np.inf, np.inf]))
 
-    return np.array([fitMass[0][0], np.sqrt(fitMass[1][0, 0])])
+    # [E, dE, logA, dlogA] — dE is the profiled (marginal) mass error
+    return np.array([fitMass[0][0], np.sqrt(fitMass[1][0, 0]),
+                     fitMass[0][1], np.sqrt(fitMass[1][1, 1])])
 
 def build2ptCorrelationMatrix(filePath, configIndex, basis):
     ws = dist.DistillWorkspace.load(filePath, configIndex)
@@ -282,6 +298,48 @@ def makeGevpReduce(ti=1, shift=0):
             state["vRef"] = vRef
             return curves
         return gevp(np.real(Csym), ti=ti, refVecs=state["vRef"])[0]
+
+    return _reduce
+
+
+def _fitLogLinear(curve, fitT):
+    """(energy, logA) from a log-linear fit on [fitT[0], fitT[1]).
+    (nan, nan) if the window has non-positive values (signal lost to noise)."""
+    y = curve[fitT[0]:fitT[1]]
+    if len(y) < 2 or np.any(y <= 0) or not np.all(np.isfinite(y)):
+        return np.nan, np.nan
+    ts = np.arange(fitT[0], fitT[1])
+    slope, intercept = np.polyfit(ts, np.log(y), 1)
+    return -slope, intercept
+
+
+def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False):
+    """
+    Reduce for bootstrapEnsemble that goes all the way to masses: anchored GEVP
+    (optionally shifted) then a two-parameter log-linear fit per state. Because
+    the fit is redone on every resample, the bootstrap distribution of the mass
+    exactly marginalizes the amplitude (and inherits all data correlations).
+    Output per resample: (n_states,) masses -> bootstrapEnsemble returns
+    [masses, err, cov] with cov the n_states x n_states mass covariance
+    (useful for splittings like E_pipi - 2 E_pi).
+    fitT is in curve-index units of the (shifted) GEVP output; pass one (lo, hi)
+    window for all states or a list of per-state windows (excited states need
+    earlier/shorter windows than the ground state).
+
+    withAmp=False: reduce output is (n_states,) masses; cov is the mass
+    covariance matrix. withAmp=True: output is (n_states, 2) with columns
+    [E, logA] — the fitted curve is exp(logA - E*t) in the (shifted) curve's
+    time units — and cov becomes (2, n, n): [0] mass cov, [1] logA cov.
+    """
+    gr = makeGevpReduce(ti=ti, shift=shift)
+    perState = isinstance(fitT[0], (tuple, list))
+
+    def _reduce(Cmean, withAmp=withAmp):
+        curves = gr(Cmean)
+        windows = fitT if perState else [fitT] * curves.shape[1]
+        fits = np.array([_fitLogLinear(curves[:, e], w)
+                         for e, w in enumerate(windows)])   # (n, 2)
+        return fits if withAmp else fits[:, 0]
 
     return _reduce
 
