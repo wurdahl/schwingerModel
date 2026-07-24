@@ -133,31 +133,38 @@ def bootstrapEnsemble(measured, weights=None, reduce=None, numResamples=10000, s
     iterator = tqdm(samplesC, desc="Bootstrap reduce", leave=False) if progress else samplesC
     samples = np.real(np.array([reduce(c) for c in iterator]))
 
-    # drop resamples where the reduce failed (e.g. massReduce fit window hit
-    # non-positive values) so they don't poison percentiles and covariance
-    valid = ~np.isnan(samples.reshape(len(samples), -1)).any(axis=1)
-    if not valid.all():
+    # Per-component NaN policy: a state whose fit fails (e.g. a sign-crossing
+    # sinh-mode in a mixed-parity basis, or a window past the noise floor) only
+    # degrades ITS OWN statistics — other states keep every resample. Covariance
+    # still needs jointly-finite rows.
+    finite = np.isfinite(samples)
+    if not finite.all():
         import warnings
-        warnings.warn(f"bootstrapEnsemble: dropped {(~valid).sum()}/{len(valid)} "
-                      "resamples with NaN reduce output")
-        samples = samples[valid]
+        fracBad = 1.0 - finite.reshape(len(samples), -1).mean(axis=0)
+        warnings.warn("bootstrapEnsemble: NaN reduce output; per-component failure "
+                      f"fractions up to {fracBad.max():.0%} "
+                      f"(components failing >5%: {(fracBad > 0.05).sum()})")
 
-    low  = np.percentile(samples, 2.5,  axis=0)
-    high = np.percentile(samples, 97.5, axis=0)
+    low  = np.nanpercentile(samples, 2.5,  axis=0)
+    high = np.nanpercentile(samples, 97.5, axis=0)
     err  = np.array([high - central, central - low])
 
-    if samples.ndim == 2:
-        cov = np.cov(samples, rowvar=False)
+    validRows = finite.reshape(len(samples), -1).all(axis=1)
+    covSamples = samples[validRows]
+    if len(covSamples) < 10:
+        cov = None
+    elif samples.ndim == 2:
+        cov = np.cov(covSamples, rowvar=False)
     elif samples.ndim == 3:
-        cov = np.array([np.cov(samples[:, :, e], rowvar=False)
-                        for e in range(samples.shape[2])])
+        cov = np.array([np.cov(covSamples[:, :, e], rowvar=False)
+                        for e in range(covSamples.shape[2])])
     else:
         cov = None
 
     return [central, err, cov]
 
 
-def gevp(corrMat, ti=1, sortBy="vector", refVecs=None):
+def gevp(corrMat, ti=1, sortBy="vector", refVecs=None, labelIdx=1):
     """
     corrMat: (n, n, dimt) symmetric correlation matrix.
     Returns newCorr (dimt-ti, n) eigenvalue curves and the reference eigenvectors.
@@ -167,7 +174,11 @@ def gevp(corrMat, ti=1, sortBy="vector", refVecs=None):
     sortBy="vector": track states across t by eigenvector overlap in the C(ti) metric —
                      GEVP eigenvectors are C(ti)-orthogonal, so |v_ref^dag C(ti) v(t)|
                      identifies which physical state each eigenpair belongs to.
-                     State labels are fixed by descending eigenvalue at t = ti+1.
+
+    labelIdx: curve index (t - ti) where state labels are fixed by descending
+    eigenvalue. Early anchors (1) can mislabel when a heavy state has a large
+    early-time amplitude (e.g. sinh-mixed bases); a later anchor (3-4) orders
+    by asymptotic energy at the cost of more noise in the anchor slice.
     """
     dimt = corrMat.shape[2]
     n = corrMat.shape[0]
@@ -192,8 +203,8 @@ def gevp(corrMat, ti=1, sortBy="vector", refVecs=None):
         vRef = _refNormalize(np.asarray(refVecs))
     else:
         # reference eigenvectors: at t=ti all eigenvalues are trivially 1, so label
-        # states at the first nontrivial time slice, ordered by descending eigenvalue
-        refIdx = 1 if len(gevpOutput) > 1 else 0
+        # states at a later slice (labelIdx), ordered by descending eigenvalue
+        refIdx = min(labelIdx, len(gevpOutput) - 1) if len(gevpOutput) > 1 else 0
         w0, v0 = gevpOutput[refIdx]
         order0 = np.argsort(np.real(w0))[::-1]
         vRef = _refNormalize(v0[:, order0])
@@ -278,7 +289,7 @@ def gevpReduce(Cmean, ti=1, refVecs=None, shift=0):
     return newCorr
 
 
-def makeGevpReduce(ti=1, shift=0):
+def makeGevpReduce(ti=1, shift=0, labelIdx=1):
     """
     Stateful gevpReduce for bootstrapping: the FIRST call (which bootstrapEnsemble2pt
     makes on the full-ensemble central mean) fixes the reference eigenvectors, and every
@@ -294,7 +305,7 @@ def makeGevpReduce(ti=1, shift=0):
         if shift:
             Csym = Csym[:, :, shift:] - Csym[:, :, :-shift]
         if "vRef" not in state:
-            curves, vRef = gevp(np.real(Csym), ti=ti)
+            curves, vRef = gevp(np.real(Csym), ti=ti, labelIdx=labelIdx)
             state["vRef"] = vRef
             return curves
         return gevp(np.real(Csym), ti=ti, refVecs=state["vRef"])[0]
@@ -313,7 +324,7 @@ def _fitLogLinear(curve, fitT):
     return -slope, intercept
 
 
-def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False):
+def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False, labelIdx=1):
     """
     Reduce for bootstrapEnsemble that goes all the way to masses: anchored GEVP
     (optionally shifted) then a two-parameter log-linear fit per state. Because
@@ -331,7 +342,7 @@ def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False):
     [E, logA] — the fitted curve is exp(logA - E*t) in the (shifted) curve's
     time units — and cov becomes (2, n, n): [0] mass cov, [1] logA cov.
     """
-    gr = makeGevpReduce(ti=ti, shift=shift)
+    gr = makeGevpReduce(ti=ti, shift=shift, labelIdx=labelIdx)
     perState = isinstance(fitT[0], (tuple, list))
 
     def _reduce(Cmean, withAmp=withAmp):
