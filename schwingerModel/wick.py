@@ -28,8 +28,15 @@ from .interpolator import Bilinear, Interpolator, MesonOp, TOL
 
 
 def _cycleDecomp(sigma):
-    """Orbits of the permutation sigma (dict index -> index), each starting from
-    its smallest element."""
+    """Decompose a permutation into its orbits (cycles).
+
+    Args:
+        sigma: Permutation as a dict mapping index -> index.
+
+    Returns:
+        list[list[int]]: The orbits of sigma, each starting from its smallest
+        element, ordered by that smallest element.
+    """
     seen, orbits = set(), []
     for start in sorted(sigma):
         if start in seen:
@@ -44,15 +51,29 @@ def _cycleDecomp(sigma):
 
 
 def _canonicalCycle(seq):
-    """Rotation-minimal form of a cycle given as a tuple of (vertex, flavor) pairs."""
+    """Rotation-minimal form of a cycle.
+
+    Args:
+        seq: Cycle as a tuple of (vertex, flavor) pairs.
+
+    Returns:
+        tuple: The lexicographically smallest rotation of seq, so that
+        symmetry-equivalent cycles compare equal.
+    """
     return min(seq[r:] + seq[:r] for r in range(len(seq)))
 
 
 def _contractMonomials(bils, labels):
-    """
-    All Wick contractions of one list of Bilinears (with per-bilinear time labels).
-    Returns {DiagramKey: integer sign sum} — coefficients of the interpolator
-    terms are applied by the caller.
+    """All Wick contractions of one monomial (product of Bilinears).
+
+    Args:
+        bils: List of Bilinears forming one monomial (sink and source concatenated).
+        labels: Time label for each bilinear, parallel to bils (e.g. "snk"/"src").
+
+    Returns:
+        dict[DiagramKey, int]: Map from canonical diagram key to the summed Wick
+        sign (-1)^{#cycles}. Coefficients of the interpolator terms are applied
+        by the caller. Empty dict if the flavor content cannot be contracted.
     """
     psi, psibar = defaultdict(list), defaultdict(list)
     for i, b in enumerate(bils):
@@ -81,13 +102,22 @@ def _contractMonomials(bils, labels):
 
 
 def contract(snkOp: Interpolator, srcOp: Interpolator, snkLabel="snk", srcLabel="src"):
-    """
-    Diagram table for <snkOp(snkLabel) srcOp^dag(srcLabel)>.
+    """Diagram table for the correlator <snkOp(snkLabel) srcOp^dag(srcLabel)>.
 
     Both operators are given in creation form; the source is daggered here
-    (flavor swap, bar flip, coefficient conjugation). Returns {DiagramKey: coeff}
-    with numerically-zero entries dropped — an empty table means the correlator
-    vanishes identically (e.g. mismatched flavor content).
+    (flavor swap, bar flip, coefficient conjugation).
+
+    Args:
+        snkOp: Sink Interpolator, in creation form.
+        srcOp: Source Interpolator, in creation form (daggered internally).
+        snkLabel: Time label attached to sink vertices. Defaults to "snk".
+        srcLabel: Time label attached to source vertices. Defaults to "src".
+
+    Returns:
+        dict[DiagramKey, complex]: Diagram table mapping canonical cycle keys to
+        coefficients (Wick sign included), with numerically-zero entries dropped.
+        An empty table means the correlator vanishes identically (e.g.
+        mismatched flavor content).
     """
     src = srcOp.dagger()
     table = defaultdict(complex)
@@ -105,12 +135,20 @@ def contract(snkOp: Interpolator, srcOp: Interpolator, snkLabel="snk", srcLabel=
 # ---------------------------------------------------------------------------
 
 def mergeFlavors(table, flavorClass=None):
-    """
-    Map propagator flavors to their degenerate class and re-merge the table.
-    flavorClass: callable flavor -> class label; default sends every flavor to "q"
-    (exact isospin degeneracy, one tau for all flavors). This is both a symbolic
-    tool (isospin-equal operators give identical merged tables) and the evaluation
-    dictionary (class label -> which tau to use).
+    """Map propagator flavors to their degenerate class and re-merge the table.
+
+    This is both a symbolic tool (isospin-equal operators give identical merged
+    tables) and the evaluation dictionary (class label -> which tau to use).
+
+    Args:
+        table: Diagram table {DiagramKey: coeff} from contract().
+        flavorClass: Callable flavor -> class label. Defaults to None, which
+            sends every flavor to "q" (exact isospin degeneracy, one tau for
+            all flavors).
+
+    Returns:
+        dict[DiagramKey, complex]: Re-merged table with flavors replaced by
+        class labels; entries that cancel after merging are dropped.
     """
     if flavorClass is None:
         flavorClass = lambda f: "q"
@@ -124,20 +162,46 @@ def mergeFlavors(table, flavorClass=None):
 
 
 def tablesEqual(a, b, tol=1e-9):
-    """Compare two diagram tables with a numerical tolerance on coefficients."""
+    """Compare two diagram tables with a numerical tolerance on coefficients.
+
+    Args:
+        a: First diagram table {DiagramKey: coeff}.
+        b: Second diagram table {DiagramKey: coeff}.
+        tol: Maximum allowed |a[k] - b[k]| per key. Defaults to 1e-9.
+
+    Returns:
+        bool: True if every key's coefficients agree within tol (missing keys
+        count as zero).
+    """
     keys = set(a) | set(b)
     return all(abs(a.get(k, 0) - b.get(k, 0)) < tol for k in keys)
 
 
 def cycleTimeLabels(cycle):
-    """Set of time labels a cycle touches: {'snk','src'} = connected in time,
-    a single label = a loop (needs ensemble-level vacuum subtraction)."""
+    """Set of time labels a cycle touches.
+
+    Args:
+        cycle: One canonical cycle — a tuple of (vertex, flavor) pairs.
+
+    Returns:
+        set[str]: The time labels visited: {'snk', 'src'} = connected in time,
+        a single label = a loop (needs ensemble-level vacuum subtraction).
+    """
     return {v[0] for v, _ in cycle}
 
 
 def splitConnected(table):
-    """Partition a table into (connected, disconnected): a diagram is connected
-    iff every cycle touches both time labels."""
+    """Partition a diagram table by time-connectedness.
+
+    A diagram is connected iff every one of its cycles touches both time labels.
+
+    Args:
+        table: Diagram table {DiagramKey: coeff}.
+
+    Returns:
+        tuple[dict, dict]: (connected, disconnected) sub-tables, each
+        {DiagramKey: coeff}; together they partition the input.
+    """
     conn, disc = {}, {}
     for key, coeff in table.items():
         if all(len(cycleTimeLabels(c)) > 1 for c in key):
@@ -148,7 +212,15 @@ def splitConnected(table):
 
 
 def formatTable(table):
-    """Human-readable rendering of a diagram table."""
+    """Human-readable rendering of a diagram table.
+
+    Args:
+        table: Diagram table {DiagramKey: coeff}.
+
+    Returns:
+        str: One line per diagram, "coeff  Tr[...] x Tr[...]", with gamma,
+        derivative, momentum, and flavor annotations on each propagator step.
+    """
     if not table:
         return "(empty table)"
     lines = []

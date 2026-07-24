@@ -15,17 +15,37 @@ from .evaluator import evalTable
 # ---------------------------------------------------------------------------
 
 def contractBasis(basis):
-    """Diagram tables for every (sink, source) pair of an Interpolator basis,
-    with flavors merged to their degenerate class. Computed once per analysis."""
+    """Diagram tables for every (sink, source) pair of an Interpolator basis.
+
+    Flavors are merged to their degenerate class. Computed once per analysis;
+    workers then only evaluate.
+
+    Args:
+        basis: Sequence of Interpolators (creation form).
+
+    Returns:
+        dict[tuple[int, int], dict]: (sinkIdx, srcIdx) -> merged diagram table
+        {DiagramKey: coeff}, for all n^2 pairs.
+    """
     return {(a, b): mergeFlavors(contract(snk, src))
             for a, snk in enumerate(basis) for b, src in enumerate(basis)}
 
 
 def _measureConfigWick(filePath, configIndex, tables, n):
     """Worker: evaluate all pair tables on one config's workspace.
-    Returns (conn (n, n, T), disc {(a,b): (coeffs, ABcorr, A, B)}) where per
-    disc diagram d: A, B are (D, T) loop series and
-    ABcorr[d, dt] = (1/T) sum_t A[d, t+dt] B[d, t]."""
+
+    Args:
+        filePath: HDF5 distillation cache path.
+        configIndex: Which config group to load.
+        tables: Output of contractBasis — {(a, b): diagram table}.
+        n: Basis size (number of interpolators).
+
+    Returns:
+        tuple: (conn, disc) where conn is (n, n, T) complex and disc is
+        {(a, b): (coeffs (D,), ABcorr (D, T), A (D, T), B (D, T))} with, per
+        disc diagram d, A/B the sink/source loop series and
+        ABcorr[d, dt] = (1/T) sum_t A[d, t+dt] B[d, t].
+    """
     ws = dist.DistillWorkspace.load(filePath, configIndex)
     T = ws.eigVecs.shape[0]
     conn = np.zeros((n, n, T), dtype=complex)
@@ -44,15 +64,23 @@ def _measureConfigWick(filePath, configIndex, tables, n):
 
 
 def measureEnsemble(filePath, configIndices, basis, n_jobs=-1):
-    """
-    Measure the full correlation-matrix data for an Interpolator basis over an
-    ensemble cache. Symbolic contraction happens once; workers only evaluate.
+    """Measure correlation-matrix data for an Interpolator basis over an ensemble.
 
-    Returns {"conn": (n_cfg, n, n, T) complex,
-             "disc": {(a,b): {"coeffs": (D,), "AB": (n_cfg, D, T),
-                              "A": (n_cfg, D, T), "B": (n_cfg, D, T)}}}
-    The disc pieces need ensemble-level vacuum subtraction — that happens in
+    Symbolic contraction happens once; parallel workers only evaluate. The disc
+    pieces need ensemble-level vacuum subtraction — that happens in
     bootstrapEnsemble, never per config.
+
+    Args:
+        filePath: HDF5 distillation cache path (from generateDistillFile).
+        configIndices: Iterable of config indices to measure.
+        basis: Sequence of Interpolators (creation form) defining the n x n matrix.
+        n_jobs: joblib worker count. Defaults to -1 (all cores).
+
+    Returns:
+        dict: {"conn": (n_cfg, n, n, T) complex array,
+        "disc": {(a, b): {"coeffs": (D,), "AB": (n_cfg, D, T),
+        "A": (n_cfg, D, T), "B": (n_cfg, D, T)}}} — pass directly to
+        bootstrapEnsemble.
     """
     tables = contractBasis(basis)
     n = len(basis)
@@ -75,7 +103,15 @@ def measureEnsemble(filePath, configIndices, basis, n_jobs=-1):
 # ---------------------------------------------------------------------------
 
 def _vacSeries(Am, Bm):
-    """(1/T) sum_t Am[..., t+dt] Bm[..., t] over the last axis, any leading axes."""
+    """Translation-averaged product of two mean loop series.
+
+    Args:
+        Am: Sink loop means, shape (..., T).
+        Bm: Source loop means, shape (..., T) broadcastable with Am.
+
+    Returns:
+        np.ndarray: (..., T) array with [..., dt] = (1/T) sum_t Am[..., t+dt] * Bm[..., t].
+    """
     T = Am.shape[-1]
     return np.stack([np.mean(np.roll(Am, -dt, axis=-1) * Bm, axis=-1)
                      for dt in range(T)], axis=-1)
@@ -83,7 +119,15 @@ def _vacSeries(Am, Bm):
 
 def _assembleC(connMean, discMeans):
     """Combine connected means with vacuum-subtracted disc pieces into C.
-    connMean: (..., n, n, T); discMeans: {(a,b): (coeffs, ABm, Am, Bm)}."""
+
+    Args:
+        connMean: Connected-part means, shape (..., n, n, T).
+        discMeans: {(a, b): (coeffs, ABm, Am, Bm)} mean disc pieces; the vacuum
+            term _vacSeries(Am, Bm) is subtracted from ABm here.
+
+    Returns:
+        np.ndarray: Full correlation matrix C, same shape as connMean.
+    """
     C = connMean.copy()
     for (a, b), (coeffs, ABm, Am, Bm) in discMeans.items():
         C[..., a, b, :] += np.einsum('d,...dt->...t', coeffs, ABm - _vacSeries(Am, Bm))
@@ -92,14 +136,30 @@ def _assembleC(connMean, discMeans):
 
 def bootstrapEnsemble(measured, weights=None, reduce=None, numResamples=10000, seed=None,
                       progress=True):
-    """
-    Bootstrap statistics for measureEnsemble output, with disc vacuum subtraction
-    done per resample (subtraction needs ensemble means, so it lives here).
+    """Bootstrap statistics for measureEnsemble output.
 
-    reduce: applied to each resample's assembled (n, n, T) matrix; None = identity,
-            or gevpReduce / makeGevpReduce(...) for GEVP curves.
-    Returns [central, err (2, ...), cov] with the same shape conventions as
-    bootstrapEnsemble2pt.
+    Disc vacuum subtraction is done per resample (subtraction needs ensemble
+    means, so it lives here, never per config). A reduce that returns NaN for
+    some components (e.g. a failed fit window) only degrades those components'
+    statistics — percentiles use nanpercentile, and a warning reports
+    per-component failure fractions.
+
+    Args:
+        measured: Output of measureEnsemble: {"conn": ..., "disc": ...}.
+        weights: (n_cfg,) reweighting factors. Defaults to None (uniform).
+        reduce: Callable applied to each resample's assembled (n, n, T) matrix —
+            e.g. makeGevpReduce(...) for GEVP curves or massReduce(...) for
+            masses. Defaults to None (identity).
+        numResamples: Number of bootstrap resamples. Defaults to 10000.
+        seed: RNG seed for reproducible resampling. Defaults to None.
+        progress: Show a tqdm bar over the reduce loop. Defaults to True.
+
+    Returns:
+        list: [central, err, cov] where central = reduce of the weighted
+        ensemble mean; err is (2, *central.shape) with rows (high - central,
+        central - low) from the 95% percentile band; cov is (T, T) for a (T,)
+        reduce output, (n, T', T') per state for a (T', n) output, and None
+        otherwise (or when fewer than 10 jointly-finite resamples remain).
     """
     conn = measured["conn"]
     disc = measured["disc"]
@@ -165,20 +225,30 @@ def bootstrapEnsemble(measured, weights=None, reduce=None, numResamples=10000, s
 
 
 def gevp(corrMat, ti=1, sortBy="vector", refVecs=None, labelIdx=1):
-    """
-    corrMat: (n, n, dimt) symmetric correlation matrix.
-    Returns newCorr (dimt-ti, n) eigenvalue curves and the reference eigenvectors.
+    """Solve the generalized eigenvalue problem C(t) v = lambda(t) C(ti) v.
 
-    sortBy="value":  order eigenvalues descending at each t independently (old behavior;
-                     mis-assigns states where curves approach or cross).
-    sortBy="vector": track states across t by eigenvector overlap in the C(ti) metric —
-                     GEVP eigenvectors are C(ti)-orthogonal, so |v_ref^dag C(ti) v(t)|
-                     identifies which physical state each eigenpair belongs to.
+    Args:
+        corrMat: (n, n, dimt) symmetric correlation matrix.
+        ti: Reference time slice for the GEVP metric C(ti). Defaults to 1.
+        sortBy: "vector" (default) tracks states across t by eigenvector overlap
+            in the C(ti) metric — GEVP eigenvectors are C(ti)-orthogonal, so
+            |v_ref^dag C(ti) v(t)| identifies which physical state each eigenpair
+            belongs to. "value" orders eigenvalues descending at each t
+            independently (old behavior; mis-assigns states where curves
+            approach or cross).
+        refVecs: External anchor eigenvectors (n, n), e.g. the ensemble-central
+            ones — keeps state labels consistent across bootstrap resamples.
+            Defaults to None (derive labels at labelIdx).
+        labelIdx: Curve index (t - ti) where state labels are fixed by
+            descending eigenvalue. Early anchors (1) can mislabel when a heavy
+            state has a large early-time amplitude (e.g. sinh-mixed bases); a
+            later anchor (3-4) orders by asymptotic energy at the cost of more
+            noise in the anchor slice. Defaults to 1.
 
-    labelIdx: curve index (t - ti) where state labels are fixed by descending
-    eigenvalue. Early anchors (1) can mislabel when a heavy state has a large
-    early-time amplitude (e.g. sinh-mixed bases); a later anchor (3-4) orders
-    by asymptotic energy at the cost of more noise in the anchor slice.
+    Returns:
+        tuple: (newCorr, vecs) — newCorr is (dimt - ti, n) eigenvalue curves,
+        one column per tracked state; vecs is the (n, n) reference eigenvector
+        matrix used for labeling (pass back as refVecs for resamples).
     """
     dimt = corrMat.shape[2]
     n = corrMat.shape[0]
@@ -221,12 +291,26 @@ def gevp(corrMat, ti=1, sortBy="vector", refVecs=None, labelIdx=1):
 
 
 def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
-    """
-    gevpStatsOut: [mean (dimt-ti, n), errors, covMat (n, dimt-ti, dimt-ti)]
-    eigenIdx: which eigenvalue to fit (0 = lowest mass, 1 = next, ...)
+    """Fit one GEVP eigenvalue curve to an exponential/cosh, in log space.
 
-    Fits in log space: minimizes relative residuals, giving equal weight per decade.
-    Covariance is propagated as Σ_log[i,j] = Σ_lin[i,j] / (C[i] * C[j]).
+    Log-space fitting minimizes relative residuals (equal weight per decade);
+    covariance is propagated as Sigma_log[i,j] = Sigma_lin[i,j] / (C[i] * C[j]).
+    The amplitude logA is free: the GEVP normalization lambda(ti) = 1 is a
+    convention, and logA != 0 measures excited-state contamination at ti.
+
+    Args:
+        gevpStatsOut: [mean (dimt-ti, n), errors, covMat (n, dimt-ti, dimt-ti)]
+            as returned by bootstrapEnsemble with a GEVP-curve reduce.
+        fitT: [lo, hi) fit window in curve-index units. Defaults to [1, 10].
+        ti: GEVP reference slice used to build the curves. Defaults to 1.
+        eigenIdx: Which eigenvalue to fit (0 = lowest mass, 1 = next, ...).
+            Defaults to 0.
+        coshExpr: Fit the periodic cosh form if True, a forward exponential if
+            False (use False for shifted or parity-odd curves). Defaults to True.
+
+    Returns:
+        np.ndarray: [E, dE, logA, dlogA] — energy, its profiled (marginal)
+        error, log-amplitude, and its error.
     """
     dimt = gevpStatsOut[0].shape[0] + ti
 
@@ -258,6 +342,17 @@ def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
                      fitMass[0][1], np.sqrt(fitMass[1][1, 1])])
 
 def build2ptCorrelationMatrix(filePath, configIndex, basis):
+    """Legacy: n x n two-point matrix on one config via dist.evalTwoPoint.
+
+    Args:
+        filePath: HDF5 distillation cache path.
+        configIndex: Which config group to load.
+        basis: Sequence of MesonOps (NOT Interpolators — this is the pre-Wick
+            hand-written path, kept as a regression oracle).
+
+    Returns:
+        np.ndarray: (n, n, T) complex correlation matrix.
+    """
     ws = dist.DistillWorkspace.load(filePath, configIndex)
     n, T = len(basis), ws.modelObj.dimt
     C = np.empty((n, n, T), dtype=complex)
@@ -267,20 +362,39 @@ def build2ptCorrelationMatrix(filePath, configIndex, basis):
     return C
 
 def measureEnsemble2pt(filePath, configIndices, basis, n_jobs=-1):
+    """Legacy: build2ptCorrelationMatrix over an ensemble, in parallel.
+
+    Args:
+        filePath: HDF5 distillation cache path.
+        configIndices: Iterable of config indices to measure.
+        basis: Sequence of MesonOps (see build2ptCorrelationMatrix).
+        n_jobs: joblib worker count. Defaults to -1 (all cores).
+
+    Returns:
+        np.ndarray: (n_cfg, n, n, T) complex — feeds bootstrapEnsemble2pt.
+    """
     correls = Parallel(n_jobs=n_jobs)(delayed(build2ptCorrelationMatrix)(filePath, ind, basis) for ind in configIndices)
 
     return np.array(correls)
 
 def gevpReduce(Cmean, ti=1, refVecs=None, shift=0):
-    """
-    Reduce one (n, n, T) mean correlation matrix to GEVP eigenvalue curves.
+    """Reduce one (n, n, T) mean correlation matrix to GEVP eigenvalue curves.
+
     Symmetrization happens here, explicitly, on the ensemble/resample mean —
     per-config matrices are NOT hermitian, only their average is.
 
-    shift > 0: solve the GEVP on the shifted matrix C(t+shift) - C(t), which
-    annihilates t-independent thermal terms (two-particle around-the-torus
-    pollution) exactly. Output has (T - shift - ti) time slices; the curves are
-    no longer cosh-shaped — fit forward-exponential on early times.
+    Args:
+        Cmean: (n, n, T) mean correlation matrix.
+        ti: GEVP reference slice. Defaults to 1.
+        refVecs: Anchor eigenvectors passed through to gevp (for consistent
+            state labels across resamples). Defaults to None.
+        shift: If > 0, solve the GEVP on C(t + shift) - C(t), which annihilates
+            t-independent thermal terms (two-particle around-the-torus
+            pollution) exactly. The curves are then no longer cosh-shaped —
+            fit forward-exponential on early times. Defaults to 0.
+
+    Returns:
+        np.ndarray: (T - shift - ti, n) eigenvalue curves, one column per state.
     """
     Csym = 0.5 * (Cmean + np.conj(np.transpose(Cmean, (1, 0, 2))))
     if shift:
@@ -290,13 +404,23 @@ def gevpReduce(Cmean, ti=1, refVecs=None, shift=0):
 
 
 def makeGevpReduce(ti=1, shift=0, labelIdx=1):
-    """
-    Stateful gevpReduce for bootstrapping: the FIRST call (which bootstrapEnsemble2pt
-    makes on the full-ensemble central mean) fixes the reference eigenvectors, and every
-    subsequent call (the resamples) labels its states against that anchor. This prevents
-    state labels from flipping between resamples when eigenvalues are close — the cause
-    of bimodal bootstrap distributions and central values outside the percentile band.
-    Create a fresh instance per bootstrapEnsemble2pt call.
+    """Stateful gevpReduce factory for bootstrapping.
+
+    The FIRST call of the returned reduce (which bootstrapEnsemble makes on the
+    full-ensemble central mean) fixes the reference eigenvectors; every
+    subsequent call (the resamples) labels its states against that anchor. This
+    prevents state labels from flipping between resamples when eigenvalues are
+    close — the cause of bimodal bootstrap distributions and central values
+    outside the percentile band. Create a fresh instance per bootstrap call.
+
+    Args:
+        ti: GEVP reference slice. Defaults to 1.
+        shift: Shift for C(t + shift) - C(t); see gevpReduce. Defaults to 0.
+        labelIdx: Anchor curve index for state labeling; see gevp. Defaults to 1.
+
+    Returns:
+        Callable[[np.ndarray], np.ndarray]: Reduce mapping a (n, n, T) mean
+        matrix to (T - shift - ti, n) anchored eigenvalue curves.
     """
     state = {}
 
@@ -314,8 +438,17 @@ def makeGevpReduce(ti=1, shift=0, labelIdx=1):
 
 
 def _fitLogLinear(curve, fitT):
-    """(energy, logA) from a log-linear fit on [fitT[0], fitT[1]).
-    (nan, nan) if the window has non-positive values (signal lost to noise)."""
+    """Two-parameter log-linear fit of one eigenvalue curve.
+
+    Args:
+        curve: (T',) eigenvalue curve.
+        fitT: (lo, hi) window in curve-index units; fits on [lo, hi).
+
+    Returns:
+        tuple[float, float]: (energy, logA) so that curve ~ exp(logA - energy * t);
+        (nan, nan) if the window has non-positive or non-finite values (signal
+        lost to noise) or fewer than 2 points.
+    """
     y = curve[fitT[0]:fitT[1]]
     if len(y) < 2 or np.any(y <= 0) or not np.all(np.isfinite(y)):
         return np.nan, np.nan
@@ -325,22 +458,32 @@ def _fitLogLinear(curve, fitT):
 
 
 def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False, labelIdx=1):
-    """
-    Reduce for bootstrapEnsemble that goes all the way to masses: anchored GEVP
-    (optionally shifted) then a two-parameter log-linear fit per state. Because
-    the fit is redone on every resample, the bootstrap distribution of the mass
-    exactly marginalizes the amplitude (and inherits all data correlations).
-    Output per resample: (n_states,) masses -> bootstrapEnsemble returns
-    [masses, err, cov] with cov the n_states x n_states mass covariance
-    (useful for splittings like E_pipi - 2 E_pi).
-    fitT is in curve-index units of the (shifted) GEVP output; pass one (lo, hi)
-    window for all states or a list of per-state windows (excited states need
-    earlier/shorter windows than the ground state).
+    """Reduce factory for bootstrapEnsemble that goes all the way to masses.
 
-    withAmp=False: reduce output is (n_states,) masses; cov is the mass
-    covariance matrix. withAmp=True: output is (n_states, 2) with columns
-    [E, logA] — the fitted curve is exp(logA - E*t) in the (shifted) curve's
-    time units — and cov becomes (2, n, n): [0] mass cov, [1] logA cov.
+    Anchored GEVP (optionally shifted), then a two-parameter log-linear fit per
+    state. Because the fit is redone on every resample, the bootstrap
+    distribution of the mass exactly marginalizes the amplitude (and inherits
+    all data correlations). Via bootstrapEnsemble the mass covariance is useful
+    for splittings like E_pipi - 2 E_pi.
+
+    Args:
+        ti: GEVP reference slice. Defaults to 1.
+        shift: Shift for C(t + shift) - C(t); see gevpReduce. Defaults to 0.
+        fitT: Fit window(s) in curve-index units of the (shifted) GEVP output:
+            one (lo, hi) pair for all states, or a list of per-state pairs
+            (excited states need earlier/shorter windows than the ground
+            state). Defaults to (2, 8).
+        withAmp: If False, the reduce returns (n_states,) masses and
+            bootstrapEnsemble's cov is the (n, n) mass covariance. If True, it
+            returns (n_states, 2) with columns [E, logA] — the fitted curve is
+            exp(logA - E * t) in the (shifted) curve's time units — and cov
+            becomes (2, n, n): [0] mass cov, [1] logA cov. Defaults to False.
+        labelIdx: Anchor curve index for state labeling; see gevp. Defaults to 1.
+
+    Returns:
+        Callable[[np.ndarray], np.ndarray]: Reduce mapping a (n, n, T) mean
+        matrix to (n_states,) masses (or (n_states, 2) with withAmp);
+        failed fits yield NaN for that state only.
     """
     gr = makeGevpReduce(ti=ti, shift=shift, labelIdx=labelIdx)
     perState = isinstance(fitT[0], (tuple, list))
@@ -356,19 +499,27 @@ def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False, labelIdx=1):
 
 
 def bootstrapEnsemble2pt(correls, weights=None, reduce=None, numResamples=10000, seed=None):
-    """
-    Bootstrap statistics over per-config correlation matrices.
+    """Legacy: bootstrap statistics over per-config correlation matrices.
 
-    correls: (n_cfg, n, n, T) from measureEnsemble2pt
-    weights: (n_cfg,) reweighting factors (default: uniform)
-    reduce:  callable applied to each resample's weighted-mean (n, n, T) matrix.
-             None -> identity (raw matrix statistics)
-             lambda C: np.real(C[a, b])        -> single-correlator stats, feeds correlMassExtract
-             lambda C: gevpReduce(C, ti=1)     -> GEVP curves (T-ti, n), feeds gevpMassExtract
-    Returns [central, err (2, ...), cov] matching the existing fitter conventions:
-             reduce output (T,)    -> cov (T, T)
-             reduce output (T', n) -> cov (n, T', T')   (per eigenvalue, like GEVPStats)
-             otherwise             -> cov None
+    (Connected-only path; for disc-aware data from measureEnsemble use
+    bootstrapEnsemble instead.)
+
+    Args:
+        correls: (n_cfg, n, n, T) array from measureEnsemble2pt.
+        weights: (n_cfg,) reweighting factors. Defaults to None (uniform).
+        reduce: Callable applied to each resample's weighted-mean (n, n, T)
+            matrix. None -> identity (raw matrix statistics);
+            lambda C: np.real(C[a, b]) -> single-correlator stats (feeds
+            correlMassExtract); lambda C: gevpReduce(C, ti=1) -> GEVP curves
+            (T - ti, n) (feeds gevpMassExtract). Defaults to None.
+        numResamples: Number of bootstrap resamples. Defaults to 10000.
+        seed: RNG seed for reproducible resampling. Defaults to None.
+
+    Returns:
+        list: [central, err, cov] matching the fitter conventions — err is
+        (2, *central.shape) with rows (high - central, central - low) from the
+        95% band; cov is (T, T) for a (T,) reduce output, (n, T', T') per
+        eigenvalue for a (T', n) output, and None otherwise.
     """
     correls = np.asarray(correls)
     n_cfg = len(correls)
