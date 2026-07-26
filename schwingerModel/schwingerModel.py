@@ -34,6 +34,9 @@ class schwingerModel:
 
         self.linkHistory = np.zeros((self.metroSteps, self.dimx,self.dimt, 2),dtype="complex128")
 
+        #per-step metropolis accept/reject record, filled by hmcChain
+        self.acceptHistory = np.zeros(self.metroSteps, dtype=bool)
+
         self.storedProps = [None]*self.metroSteps
 
         #used to store conjugate gradient answers during one trajectory
@@ -283,6 +286,6 @@ class schwingerModel:
     
     def hmcChain(self):
         for currentStep in tqdm(range(self.metroSteps), position=self.tqdmPosition, leave=True):
-            self.hmcStep(numSubSteps=self.numSubSteps)
+            self.acceptHistory[currentStep] = self.hmcStep(numSubSteps=self.numSubSteps)
             self.linkHistory[currentStep] = self.gaugeLinks
 

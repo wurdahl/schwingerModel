@@ -1,0 +1,32 @@
+#gauge generation input for run_sim.py:  python run_sim.py inputs/example.toml
+#(values here reproduce the ryanComp ensemble)
+
+outputFile = "configs/ryanComp.pkl"
+
+[physics]
+beta = 2.0
+fMass = 0.2
+aSpacing = 1.0      #optional, default 1.0
+
+[lattice]
+dimx = 8
+dimt = 16
+
+[run]
+targetConfigs = 5000   #total thermalized configurations after merging chains
+burnIn = 500           #discarded from the START of each chain before merging
+nCores = 10            #optional, default: all cores
+#nChains = 10          #optional, default: nCores (chain i uses randSeed + i)
+#randSeed = 0          #optional base seed
+#cgRtol = 1e-5         #optional CG tolerance
+
+[substeps]
+#give numSubSteps to use a fixed value, or omit it to tune automatically:
+#pilot chains scan substep counts (doubling then bisection) until the
+#metropolis acceptance, measured on the second half of the pilot, reaches
+#targetAcceptance
+numSubSteps = 20
+#targetAcceptance = 0.8
+#pilotSteps = 100
+#startSubSteps = 5
+#maxSubSteps = 500

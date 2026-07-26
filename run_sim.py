@@ -1,46 +1,153 @@
+"""
+Gauge configuration generation driven by a TOML input file:
+
+    python run_sim.py inputs/example.toml
+
+Runs nChains independent HMC chains in parallel, discards the per-chain burn-in,
+merges the thermalized configurations, and pickles the result. The number of
+HMC substeps is either given explicitly (numSubSteps) or tuned automatically by
+scanning pilot chains until the target metropolis acceptance rate is reached.
+See inputs/example.toml for all recognized fields.
+"""
+
+import os
+import sys
+import pickle
+import tomllib
+
 import numpy as np
 from joblib import Parallel, delayed
-import pickle
+from tqdm import tqdm
+
 import schwingerModel as sim
 
-a = 1
-dimx = 8
-dimt = 16
 
-R = 10/(32*16) #ratio that we want to keep constant while taking continuum limit
+def loadInput(path):
+    with open(path, 'rb') as f:
+        raw = tomllib.load(f)
 
-# beta = R*dimx*dimt
-beta = 2.0
+    cfg = {
+        #required
+        'outputFile': raw['outputFile'],
+        'beta':  raw['physics']['beta'],
+        'fMass': raw['physics']['fMass'],
+        'dimx':  raw['lattice']['dimx'],
+        'dimt':  raw['lattice']['dimt'],
+        'targetConfigs': raw['run']['targetConfigs'],
+        'burnIn':        raw['run']['burnIn'],
+        #optional
+        'aSpacing': raw['physics'].get('aSpacing', 1.0),
+        'cgRtol':   raw['run'].get('cgRtol', 1e-5),
+        'randSeed': raw['run'].get('randSeed', 0),
+        'nCores':   raw['run'].get('nCores', os.cpu_count()),
+    }
+    cfg['nChains'] = raw['run'].get('nChains', cfg['nCores'])
 
-# m = 0.2 *np.sqrt(10/beta)
-m=.2
+    sub = raw.get('substeps', {})
+    cfg['numSubSteps']      = sub.get('numSubSteps')        # None -> tune automatically
+    cfg['targetAcceptance'] = sub.get('targetAcceptance', 0.8)
+    cfg['pilotSteps']       = sub.get('pilotSteps', 100)
+    cfg['startSubSteps']    = sub.get('startSubSteps', 5)
+    cfg['maxSubSteps']      = sub.get('maxSubSteps', 500)
 
-targetConfigs = 5000
-burnIn = 500
-nThreads = 10
-stepsPerChain = targetConfigs // nThreads
-
-subSteps = 20
+    return cfg
 
 
-def run_chain(seed):
+def pilotAcceptance(cfg, numSubSteps):
+    """Acceptance rate of a short pilot chain, measured on its second half
+    so the cold-start transient does not bias the estimate."""
     model = sim.schwingerModel(
-        metroSteps=burnIn + stepsPerChain,
-        beta=beta, dimx=dimx, dimt=dimt,
-        aSpacing=a, fMass=m, cgRtol=1e-5,
-        randSeed=seed, tqdmPosition=seed,
-        numSubSteps=subSteps
+        metroSteps=cfg['pilotSteps'],
+        beta=cfg['beta'], dimx=cfg['dimx'], dimt=cfg['dimt'],
+        aSpacing=cfg['aSpacing'], fMass=cfg['fMass'], cgRtol=cfg['cgRtol'],
+        randSeed=cfg['randSeed'], numSubSteps=numSubSteps,
+        tqdmPosition=1,   #keep the pilot bar below the tuning report lines
     )
-    return model if seed == 0 else model.linkHistory[burnIn:]
+    return np.mean(model.acceptHistory[cfg['pilotSteps']//2:])
 
-if __name__ == '__main__':
-    results = Parallel(n_jobs=nThreads)(delayed(run_chain)(seed) for seed in range(nThreads))
+
+def tuneSubSteps(cfg):
+    """
+    Scans substep counts until the target acceptance is reached: doubling to
+    bracket, then bisecting to the smallest passing count (within ~10%).
+    """
+    target = cfg['targetAcceptance']
+
+    lo = None                       # last failing count
+    hi = cfg['startSubSteps']
+    while hi <= cfg['maxSubSteps']:
+        acc = pilotAcceptance(cfg, hi)
+        tqdm.write(f"  substeps {hi:4d}: acceptance {acc:.2f}")
+        if acc >= target:
+            break
+        lo, hi = hi, hi*2
+    else:
+        raise RuntimeError(f"acceptance {target} not reached by {cfg['maxSubSteps']} substeps")
+
+    if lo is None:
+        return hi
+
+    #bisect the bracket [lo (fail), hi (pass)] down to ~10% granularity
+    while hi - lo > max(1, hi//10):
+        mid = (lo + hi)//2
+        acc = pilotAcceptance(cfg, mid)
+        tqdm.write(f"  substeps {mid:4d}: acceptance {acc:.2f}")
+        if acc >= target:
+            hi = mid
+        else:
+            lo = mid
+
+    return hi
+
+
+def runChain(cfg, chainIndex, numSubSteps, stepsPerChain):
+    model = sim.schwingerModel(
+        metroSteps=cfg['burnIn'] + stepsPerChain,
+        beta=cfg['beta'], dimx=cfg['dimx'], dimt=cfg['dimt'],
+        aSpacing=cfg['aSpacing'], fMass=cfg['fMass'], cgRtol=cfg['cgRtol'],
+        randSeed=cfg['randSeed'] + chainIndex, tqdmPosition=chainIndex,
+        numSubSteps=numSubSteps,
+    )
+    #chain 0 carries the model object; the rest only their thermalized links
+    return model if chainIndex == 0 else model.linkHistory[cfg['burnIn']:]
+
+
+def main(inputPath):
+    cfg = loadInput(inputPath)
+
+    if cfg['numSubSteps'] is not None:
+        numSubSteps = cfg['numSubSteps']
+        print(f"using {numSubSteps} substeps (given in input file)")
+    else:
+        print(f"tuning substeps for acceptance >= {cfg['targetAcceptance']}:")
+        numSubSteps = tuneSubSteps(cfg)
+        print(f"using {numSubSteps} substeps")
+
+    stepsPerChain = -(-cfg['targetConfigs'] // cfg['nChains'])   # ceil division
+
+    print(f"running {cfg['nChains']} chains x ({cfg['burnIn']} burn-in + {stepsPerChain} configs) "
+          f"on {cfg['nCores']} cores")
+
+    results = Parallel(n_jobs=cfg['nCores'])(
+        delayed(runChain)(cfg, i, numSubSteps, stepsPerChain) for i in range(cfg['nChains']))
 
     base = results[0]
-    merged = np.concatenate([base.linkHistory[burnIn:]] + results[1:])
-    base.linkHistory = merged
-    base.metroSteps = targetConfigs
-    base.storedProps = [None] * targetConfigs
+    merged = np.concatenate([base.linkHistory[cfg['burnIn']:]] + list(results[1:]))
+    merged = merged[:cfg['targetConfigs']]
 
-    with open('configs/ryanComp.pkl', 'wb') as f:
+    base.linkHistory = merged
+    base.metroSteps = len(merged)
+    base.storedProps = [None]*len(merged)
+    base.acceptHistory = np.zeros(len(merged), dtype=bool)   # per-chain record, not meaningful after merging
+
+    os.makedirs(os.path.dirname(cfg['outputFile']) or '.', exist_ok=True)
+    with open(cfg['outputFile'], 'wb') as f:
         pickle.dump(base, f)
+
+    print(f"saved {len(merged)} configurations to {cfg['outputFile']}")
+
+
+if __name__ == '__main__':
+    if len(sys.argv) != 2:
+        sys.exit("usage: python run_sim.py <input.toml>")
+    main(sys.argv[1])
