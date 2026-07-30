@@ -8,3 +8,4 @@ from . import GEVP
 from . import interpolator
 from . import wick
 from . import evaluator
+from . import topology

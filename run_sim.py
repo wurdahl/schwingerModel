@@ -40,6 +40,7 @@ def loadInput(path):
         'cgRtol':   raw['run'].get('cgRtol', 1e-5),
         'randSeed': raw['run'].get('randSeed', 0),
         'nCores':   raw['run'].get('nCores', os.cpu_count()),
+        'tunneling': raw['run'].get('tunneling', False),
     }
     cfg['nChains'] = raw['run'].get('nChains', cfg['nCores'])
 
@@ -106,10 +107,14 @@ def runChain(cfg, chainIndex, numSubSteps, stepsPerChain):
         beta=cfg['beta'], dimx=cfg['dimx'], dimt=cfg['dimt'],
         aSpacing=cfg['aSpacing'], fMass=cfg['fMass'], cgRtol=cfg['cgRtol'],
         randSeed=cfg['randSeed'] + chainIndex, tqdmPosition=chainIndex,
-        numSubSteps=numSubSteps,
+        numSubSteps=numSubSteps,tunneling=cfg['tunneling']
     )
-    #chain 0 carries the model object; the rest only their thermalized links
-    return model if chainIndex == 0 else model.linkHistory[cfg['burnIn']:]
+    #chain 0 carries the model object; the rest only their thermalized history
+    if chainIndex == 0:
+        return model
+    return (model.linkHistory[cfg['burnIn']:],
+            model.acceptHistory[cfg['burnIn']:],
+            model.tunnelAcceptance[cfg['burnIn']:])
 
 
 def main(inputPath):
@@ -132,13 +137,20 @@ def main(inputPath):
         delayed(runChain)(cfg, i, numSubSteps, stepsPerChain) for i in range(cfg['nChains']))
 
     base = results[0]
-    merged = np.concatenate([base.linkHistory[cfg['burnIn']:]] + list(results[1:]))
-    merged = merged[:cfg['targetConfigs']]
+    nKeep = cfg['targetConfigs']
+    merged = np.concatenate([base.linkHistory[cfg['burnIn']:]] + [r[0] for r in results[1:]])[:nKeep]
+    mergedAccept = np.concatenate([base.acceptHistory[cfg['burnIn']:]] + [r[1] for r in results[1:]])[:nKeep]
+    mergedTunnel = np.concatenate([base.tunnelAcceptance[cfg['burnIn']:]] + [r[2] for r in results[1:]])[:nKeep]
 
     base.linkHistory = merged
     base.metroSteps = len(merged)
     base.storedProps = [None]*len(merged)
-    base.acceptHistory = np.zeros(len(merged), dtype=bool)   # per-chain record, not meaningful after merging
+    #per-config accept flags survive the merge; only autocorrelation across chain boundaries is meaningless
+    base.acceptHistory = mergedAccept
+    base.tunnelAcceptance = mergedTunnel
+
+    if cfg['tunneling']:
+        print(f"tunnel step acceptance: {mergedTunnel.mean():.3f}")
 
     os.makedirs(os.path.dirname(cfg['outputFile']) or '.', exist_ok=True)
     with open(cfg['outputFile'], 'wb') as f:

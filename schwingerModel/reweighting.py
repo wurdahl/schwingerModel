@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from .schwingerModel import schwingerModel
 
 from . import buildOps as ops
+from . import topology as top
 
 
 def getWeightingFactors(modelObj: schwingerModel, chemicalPot=1, burnIn=1, autocorrSkip=10):
@@ -49,16 +50,8 @@ def getWeightingFactorsTheta(modelObj: schwingerModel, theta=0, burnIn=1, autoco
     for i in range(burnIn, modelObj.metroSteps, autocorrSkip):
         currLinks = modelObj.linkHistory[i]
 
-        Ut = currLinks[:,:,0] # Time links (shape: dimx, dimt)
-        Ux = currLinks[:,:,1] # Space links (shape: dimx, dimt)
+        weights.append(top.getTopoQ(currLinks))
 
-        # Shift arrays to get U_t(x+1, t) and U_x(x, t+1)
-        Ut_shifted_x = np.roll(Ut, shift=-1, axis=0)
-        Ux_shifted_t = np.roll(Ux, shift=-1, axis=1)
+    return np.exp(1j*theta*np.array(weights))
 
-        # Multiply the four sides of the plaquette
-        plaq = Ux * Ut_shifted_x * np.conjugate(Ux_shifted_t) * np.conjugate(Ut)
 
-        weights.append(np.sum(np.angle(plaq)))
-
-    return np.exp(1j*theta*np.array(weights)/(2*np.pi))

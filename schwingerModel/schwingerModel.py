@@ -1,18 +1,20 @@
 import numpy as np
 from scipy.special import iv
 from scipy.sparse.linalg import cg, bicgstab
-from scipy.sparse.linalg import LinearOperator
+from scipy.sparse.linalg import LinearOperator, splu
 import scipy.sparse as sparse
-from scipy.stats import bootstrap
-from scipy.optimize import curve_fit
+
+
 from tqdm import tqdm
 
 from . import buildOps as ops
+from . import topology as top
 
 class schwingerModel:
 
     def __init__(self, dimx = 4, dimt=4, metroSteps = 100, beta = 10, fMass = 1,
-                  aSpacing=1,cgRtol = 1e-10, numSubSteps=100, randSeed=0, tqdmPosition=0):
+                  aSpacing=1,cgRtol = 1e-10, numSubSteps=100, randSeed=0, tqdmPosition=0,
+                  tunneling = False):
 
         #define gamma matrices
         self.gammax = np.array([[0,1],[1,0]])
@@ -29,6 +31,7 @@ class schwingerModel:
         self.a = aSpacing
         self.cgRtol = cgRtol
         self.numSubSteps = numSubSteps
+        self.tunneling = tunneling
         
         self.gaugeLinks = np.full((dimx,dimt,2),1+0j)
 
@@ -36,6 +39,7 @@ class schwingerModel:
 
         #per-step metropolis accept/reject record, filled by hmcChain
         self.acceptHistory = np.zeros(self.metroSteps, dtype=bool)
+        self.tunnelAcceptance = np.zeros(self.metroSteps, dtype=bool)
 
         self.storedProps = [None]*self.metroSteps
 
@@ -229,10 +233,10 @@ class schwingerModel:
         Force[:, :, 1] -= 2 * Z_x.real
 
         # Time: Z_t = -c*Ut * <X|P-_t|Y_{t+1}> + c*Ut* * <X_{t+1}|P+_t|Y>
-        Pm_t_Y_tp1 = np.einsum('ij,xyj->xyi', P_minus_t, Y_tp1)
-        Pp_t_Y     = np.einsum('ij,xyj->xyi', P_plus_t,  Y)
-        Z_t = (-c * Ut      * np.einsum('xyi,xyi->xy', np.conj(X),     Pm_t_Y_tp1)
-               + c * np.conj(Ut) * np.einsum('xyi,xyi->xy', np.conj(X_tp1), Pp_t_Y))
+        Pm_t_Y_tp1 = np.einsum('ij,xyj->xyi', P_minus_t, Y_tp1,optimize=True)
+        Pp_t_Y     = np.einsum('ij,xyj->xyi', P_plus_t,  Y, optimize=True)
+        Z_t = (-c * Ut      * np.einsum('xyi,xyi->xy', np.conj(X),     Pm_t_Y_tp1, optimize=True)
+               + c * np.conj(Ut) * np.einsum('xyi,xyi->xy', np.conj(X_tp1), Pp_t_Y, optimize=True))
 
         # Anti-periodic boundary condition: flip sign at t = dimt-1
         bc_t = np.ones((self.dimx, self.dimt))
@@ -283,9 +287,44 @@ class schwingerModel:
             success=False
 
         return success
+
+    def logAbsDetD(self,D):                      # D: sparse Dirac operator
+        lu = splu(D.tocsc(), permc_spec="MMD_AT_PLUS_A")
+        return np.log(np.abs(lu.U.diagonal())).sum()
+
+    def tunnelStep(self):
+        gaugeLinksCopy = np.copy(self.gaugeLinks)
+
+        dQ = self.rng.choice([-1,1])
+
+        instanton = top.instanton(dQ, self.dimx,self.dimt)
+
+        gaugeLinksCopy*=instanton
+
+        diracCurrent = ops.buildDiracOp(self, self.gaugeLinks)
+        diracProp = ops.buildDiracOp(self, gaugeLinksCopy)
+
+        metroFactor = np.exp(self.totalAction(self.gaugeLinks)-self.totalAction(gaugeLinksCopy)
+                             -2*self.logAbsDetD(diracCurrent)+2*self.logAbsDetD(diracProp))
+
+        r=self.rng.random()
+        if(r<metroFactor):
+            success=True
+            self.gaugeLinks = gaugeLinksCopy
+        else:
+            success=False
+
+        return success
+
     
     def hmcChain(self):
         for currentStep in tqdm(range(self.metroSteps), position=self.tqdmPosition, leave=True):
             self.acceptHistory[currentStep] = self.hmcStep(numSubSteps=self.numSubSteps)
+
+            if(self.tunneling):
+                #if doing tunneling steps, do them here
+                self.tunnelAcceptance[currentStep] = self.tunnelStep()
+
             self.linkHistory[currentStep] = self.gaugeLinks
+
 

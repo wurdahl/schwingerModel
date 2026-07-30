@@ -1,0 +1,32 @@
+#gauge generation input for run_sim.py
+
+outputFile = "configs/beta_3_m0_0.2_Nx_10_Nt_32_melted.pkl"
+
+[physics]
+beta = 3.0
+fMass = 0.2
+aSpacing = 1.0      #optional, default 1.0
+
+[lattice]
+dimx = 10
+dimt = 32
+
+[run]
+targetConfigs = 50000   #total thermalized configurations after merging chains
+burnIn = 500           #discarded from the START of each chain before merging
+nCores = 16            #optional, default: all cores
+#nChains = 10          #optional, default: nCores (chain i uses randSeed + i)
+#randSeed = 0          #optional base seed
+cgRtol = 1e-5         #optional CG tolerance
+tunneling = true      #optional topological tunneling boost
+
+[substeps]
+#give numSubSteps to use a fixed value, or omit it to tune automatically:
+#pilot chains scan substep counts (doubling then bisection) until the
+#metropolis acceptance, measured on the second half of the pilot, reaches
+#targetAcceptance
+#numSubSteps = 20
+targetAcceptance = 0.99
+pilotSteps = 100
+startSubSteps = 5
+jmaxSubSteps = 500
