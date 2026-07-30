@@ -2,7 +2,6 @@ from .schwingerModel import schwingerModel
 from . import reweighting
 from . import analysis
 from . import buildOps
-from . import correlation
 from . import distillation
 from . import GEVP
 from . import interpolator

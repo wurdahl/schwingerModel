@@ -13,7 +13,7 @@ from . import topology as top
 class schwingerModel:
 
     def __init__(self, dimx = 4, dimt=4, metroSteps = 100, beta = 10, fMass = 1,
-                  aSpacing=1,cgRtol = 1e-10, numSubSteps=100, randSeed=0, tqdmPosition=0,
+                  aSpacing=1, cgRtol = 1e-10, numSubSteps=100, randSeed=0, tqdmPosition=0,
                   tunneling = False):
 
         #define gamma matrices
