@@ -5,7 +5,7 @@ import scipy.sparse as sparse
 from scipy.sparse.linalg import splu
 from scipy.stats import bootstrap
 from scipy.optimize import curve_fit
-from tqdm.auto import tqdm
+from tqdm import tqdm
 from joblib import Parallel, delayed
 import joblib
 import contextlib

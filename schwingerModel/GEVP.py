@@ -3,7 +3,7 @@ from joblib import Parallel, delayed
 import joblib
 from scipy.linalg import eig
 from scipy.optimize import curve_fit, linear_sum_assignment
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from . import distillation as dist
 from .wick import contract, mergeFlavors

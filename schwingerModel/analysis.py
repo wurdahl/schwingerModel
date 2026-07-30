@@ -6,7 +6,6 @@ from tqdm import tqdm
 
 from .schwingerModel import schwingerModel
 from . import buildOps as ops
-from . import correlation as corr
 from . import reweighting
 
 def getPlaqAvg(gaugeLinks):
