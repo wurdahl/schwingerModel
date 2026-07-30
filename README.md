@@ -8,7 +8,10 @@ The analysis code includes:
 - GEVP
 - Theta term reweighting
 
-Map of the repo:
+# Quick Start
+See example.ipynb for how to construct arbitatry interpolator bases for GEVP and how to analyze configurations.
+
+# Map of the repo (in progress):
 - SchwingerModel.py: contains the gauge generation code
     - SchwingerModel class
         - parameters:

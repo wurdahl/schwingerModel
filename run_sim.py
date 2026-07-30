@@ -144,7 +144,6 @@ def main(inputPath):
 
     base.linkHistory = merged
     base.metroSteps = len(merged)
-    base.storedProps = [None]*len(merged)
     #per-config accept flags survive the merge; only autocorrelation across chain boundaries is meaningless
     base.acceptHistory = mergedAccept
     base.tunnelAcceptance = mergedTunnel

@@ -341,39 +341,8 @@ def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
     return np.array([fitMass[0][0], np.sqrt(fitMass[1][0, 0]),
                      fitMass[0][1], np.sqrt(fitMass[1][1, 1])])
 
-def build2ptCorrelationMatrix(filePath, configIndex, basis):
-    """Legacy: n x n two-point matrix on one config via dist.evalTwoPoint.
 
-    Args:
-        filePath: HDF5 distillation cache path.
-        configIndex: Which config group to load.
-        basis: Sequence of MesonOps (NOT Interpolators — this is the pre-Wick
-            hand-written path, kept as a regression oracle).
 
-    Returns:
-        np.ndarray: (n, n, T) complex correlation matrix.
-    """
-    ws = dist.DistillWorkspace.load(filePath, configIndex)
-    n, T = len(basis), ws.modelObj.dimt
-    C = np.empty((n, n, T), dtype=complex)
-    for a, snk in enumerate(basis):
-        for b, src in enumerate(basis):
-            C[a, b] = dist.evalTwoPoint(ws, snk, src)
-    return C
-
-def measureEnsemble2pt(filePath, configIndices, basis, n_jobs=-1):
-    """Legacy: build2ptCorrelationMatrix over an ensemble, in parallel.
-
-    Args:
-        filePath: HDF5 distillation cache path.
-        configIndices: Iterable of config indices to measure.
-        basis: Sequence of MesonOps (see build2ptCorrelationMatrix).
-        n_jobs: joblib worker count. Defaults to -1 (all cores).
-
-    Returns:
-        np.ndarray: (n_cfg, n, n, T) complex — feeds bootstrapEnsemble2pt.
-    """
-    correls = Parallel(n_jobs=n_jobs)(delayed(build2ptCorrelationMatrix)(filePath, ind, basis) for ind in configIndices)
 
     return np.array(correls)
 
@@ -498,62 +467,4 @@ def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False, labelIdx=1):
     return _reduce
 
 
-def bootstrapEnsemble2pt(correls, weights=None, reduce=None, numResamples=10000, seed=None):
-    """Legacy: bootstrap statistics over per-config correlation matrices.
-
-    (Connected-only path; for disc-aware data from measureEnsemble use
-    bootstrapEnsemble instead.)
-
-    Args:
-        correls: (n_cfg, n, n, T) array from measureEnsemble2pt.
-        weights: (n_cfg,) reweighting factors. Defaults to None (uniform).
-        reduce: Callable applied to each resample's weighted-mean (n, n, T)
-            matrix. None -> identity (raw matrix statistics);
-            lambda C: np.real(C[a, b]) -> single-correlator stats (feeds
-            correlMassExtract); lambda C: gevpReduce(C, ti=1) -> GEVP curves
-            (T - ti, n) (feeds gevpMassExtract). Defaults to None.
-        numResamples: Number of bootstrap resamples. Defaults to 10000.
-        seed: RNG seed for reproducible resampling. Defaults to None.
-
-    Returns:
-        list: [central, err, cov] matching the fitter conventions — err is
-        (2, *central.shape) with rows (high - central, central - low) from the
-        95% band; cov is (T, T) for a (T,) reduce output, (n, T', T') per
-        eigenvalue for a (T', n) output, and None otherwise.
-    """
-    correls = np.asarray(correls)
-    n_cfg = len(correls)
-    if weights is None:
-        weights = np.ones(n_cfg)
-    if reduce is None:
-        reduce = lambda C: C
-
-    # Resampling via multinomial counts: a bootstrap draw of configs (with replacement)
-    # is equivalent to integer counts summing to n_cfg, so each resample's weighted mean
-    # is one row of a single (numResamples, n_cfg) @ (n_cfg, n*n*T) matmul.
-    rng = np.random.default_rng(seed)
-    counts = rng.multinomial(n_cfg, np.full(n_cfg, 1.0 / n_cfg), size=numResamples)
-    wEff = counts * weights[None, :]                              # (R, n_cfg)
-
-    flat = correls.reshape(n_cfg, -1)
-    sampleMeans = (wEff @ flat) / wEff.sum(axis=1, keepdims=True)  # (R, n*n*T)
-    sampleMeans = sampleMeans.reshape(numResamples, *correls.shape[1:])
-
-    centralMean = np.tensordot(weights, correls, axes=(0, 0)) / weights.sum()
-    central = np.real(reduce(centralMean))
-    samples = np.real(np.array([reduce(m) for m in sampleMeans]))
-
-    low  = np.percentile(samples, 2.5,  axis=0)
-    high = np.percentile(samples, 97.5, axis=0)
-    err  = np.array([high - central, central - low])
-
-    if samples.ndim == 2:                                          # (R, T)
-        cov = np.cov(samples, rowvar=False)
-    elif samples.ndim == 3:                                        # (R, T', n): per-eigenvalue
-        cov = np.array([np.cov(samples[:, :, e], rowvar=False)
-                        for e in range(samples.shape[2])])
-    else:
-        cov = None
-
-    return [central, err, cov]
 

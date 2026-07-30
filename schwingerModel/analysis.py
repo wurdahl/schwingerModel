@@ -378,65 +378,6 @@ def getCorrelation(modelObj,gaugeLinks,Gamma=np.array([[1j,0],[0,-1j]]), k=0, sm
     #return both connected and disconnected part
     return np.real(correl_conn), correl_disc, trace_source_avg
 
-def acceptanceFraction(modelObj: schwingerModel):
-    history = modelObj.linkHistory
-    accepted = np.array([
-        not np.array_equal(history[i], history[i - 1])
-        for i in range(1, len(history))
-    ])
-    return accepted.mean()
-
-
-
-def getChiralCondensate(modelObj: schwingerModel, gaugeIndex = 0):
-
-    dOp = ops.buildDiracOp(modelObj, modelObj.linkHistory[gaugeIndex])
-
-    prop = np.linalg.inv(dOp.toarray())
-
-    stridex = modelObj.dimt*2
-    stridet = 2
-
-    # Store the local trace Tr[Gamma S(x,t; x,t)] for every point
-    condensate = np.zeros((modelObj.dimt, modelObj.dimx), dtype=complex)
-
-    for t in range(modelObj.dimt):           
-        for x in range(modelObj.dimx):
-            idx_start = x * stridex + t * stridet
-            idx_end = idx_start + 2
-            propxx = prop[idx_start:idx_end, idx_start:idx_end]
-            condensate[t, x] = np.trace(propxx)
-
-    condensate_avg = np.mean(condensate).real
-
-    return condensate_avg
-
-def getCondensateStats(modelObj: schwingerModel, burnIn = 1, autocorrSkip = 1):
-
-    condensates = []
-
-    for gaugeIndex in range(burnIn, modelObj.metroSteps, autocorrSkip):
-        condensates.append(getChiralCondensate(modelObj, gaugeIndex))
-
-    condensates = np.array(condensates)
-
-    return np.array([np.mean(condensates), np.std(condensates)])
-
-def getEffMassRhoBar(modelObj: schwingerModel):
-    allCorrs = []
-    nSamp=modelObj.metroSteps
-    for i in range(nSamp):
-        allCorrs.append(getCorrelation(modelObj,modelObj.linkHistory[i])[0])
-
-    allCorrs = np.array(allCorrs)
-    effectiveMassExample = np.log(allCorrs[:,4]/allCorrs[:,5])
-
-    np.arange(nSamp)
-
-    GammaBar = 1/(nSamp - np.arange(nSamp))*(np.correlate(effectiveMassExample-np.mean(effectiveMassExample),effectiveMassExample-np.mean(effectiveMassExample),mode='full')[nSamp-1:])
-    rhoBar = GammaBar/GammaBar[0]
-
-    return rhoBar
 
 def getNumDensityRhoBar(modelObj: schwingerModel, burnIn=0, chemicalPot=0.0):
     """Compute the normalized autocorrelation function rhoBar for the number density.

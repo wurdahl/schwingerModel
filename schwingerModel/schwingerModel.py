@@ -1,7 +1,6 @@
 import numpy as np
-from scipy.special import iv
-from scipy.sparse.linalg import cg, bicgstab
-from scipy.sparse.linalg import LinearOperator, splu
+from scipy.sparse.linalg import cg
+from scipy.sparse.linalg import splu
 import scipy.sparse as sparse
 
 
@@ -40,8 +39,6 @@ class schwingerModel:
         #per-step metropolis accept/reject record, filled by hmcChain
         self.acceptHistory = np.zeros(self.metroSteps, dtype=bool)
         self.tunnelAcceptance = np.zeros(self.metroSteps, dtype=bool)
-
-        self.storedProps = [None]*self.metroSteps
 
         #used to store conjugate gradient answers during one trajectory
         self.previous_CG_ans = None
