@@ -135,13 +135,13 @@ def _assembleC(connMean, discMeans):
 
 
 def bootstrapEnsemble(measured, weights=None, reduce=None, numResamples=10000, seed=None,
-                      progress=True):
+                      progress=True, quantile=.68):
     """Bootstrap statistics for measureEnsemble output.
 
     Disc vacuum subtraction is done per resample (subtraction needs ensemble
     means, so it lives here, never per config). A reduce that returns NaN for
     some components (e.g. a failed fit window) only degrades those components'
-    statistics — percentiles use nanpercentile, and a warning reports
+    statistics — the band uses nanquantile, and a warning reports
     per-component failure fractions.
 
     Args:
@@ -153,11 +153,13 @@ def bootstrapEnsemble(measured, weights=None, reduce=None, numResamples=10000, s
         numResamples: Number of bootstrap resamples. Defaults to 10000.
         seed: RNG seed for reproducible resampling. Defaults to None.
         progress: Show a tqdm bar over the reduce loop. Defaults to True.
+        quantile: Central coverage (0-1) of the bootstrap error band.
+            Defaults to 0.68 (~1 sigma); 0.95 recovers the old 95% band.
 
     Returns:
         list: [central, err, cov] where central = reduce of the weighted
         ensemble mean; err is (2, *central.shape) with rows (high - central,
-        central - low) from the 95% percentile band; cov is (T, T) for a (T,)
+        central - low) from the central quantile band; cov is (T, T) for a (T,)
         reduce output, (n, T', T') per state for a (T', n) output, and None
         otherwise (or when fewer than 10 jointly-finite resamples remain).
     """
@@ -205,8 +207,8 @@ def bootstrapEnsemble(measured, weights=None, reduce=None, numResamples=10000, s
                       f"fractions up to {fracBad.max():.0%} "
                       f"(components failing >5%: {(fracBad > 0.05).sum()})")
 
-    low  = np.nanpercentile(samples, 2.5,  axis=0)
-    high = np.nanpercentile(samples, 97.5, axis=0)
+    low  = np.nanquantile(samples, (1-quantile)/2,  axis=0)
+    high = np.nanquantile(samples, (1+quantile)/2, axis=0)
     err  = np.array([high - central, central - low])
 
     validRows = finite.reshape(len(samples), -1).all(axis=1)
@@ -341,10 +343,6 @@ def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
     return np.array([fitMass[0][0], np.sqrt(fitMass[1][0, 0]),
                      fitMass[0][1], np.sqrt(fitMass[1][1, 1])])
 
-
-
-
-    return np.array(correls)
 
 def gevpReduce(Cmean, ti=1, refVecs=None, shift=0):
     """Reduce one (n, n, T) mean correlation matrix to GEVP eigenvalue curves.

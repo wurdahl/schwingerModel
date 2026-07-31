@@ -1,15 +1,15 @@
 #gauge generation input for run_sim.py
 
-outputFile = "configs/beta_3_m0_0.0_Nx_16_Nt_32_melted.pkl"
+outputFile = "configs/beta_30_m0_0.0_Nx_64_Nt_64_melted.pkl"
 
 [physics]
-beta = 4
+beta = 30
 fMass = 0.0
 aSpacing = 1.0      #optional, default 1.0
 
 [lattice]
-dimx = 16
-dimt = 32
+dimx = 64
+dimt = 64
 
 [run]
 targetConfigs = 50000   #total thermalized configurations after merging chains
@@ -27,6 +27,6 @@ tunneling = true      #optional topological tunneling boost
 #targetAcceptance
 #numSubSteps = 33
 targetAcceptance = 0.95
-pilotSteps = 100
-startSubSteps = 5
+pilotSteps = 20
+startSubSteps = 50
 jmaxSubSteps = 500
