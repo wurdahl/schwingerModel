@@ -4,9 +4,9 @@ from scipy.stats import bootstrap
 from scipy.optimize import curve_fit
 from tqdm import tqdm
 
-from .schwingerModel import schwingerModel
 from . import buildOps as ops
 from . import reweighting
+from .params import LatticeParams
 
 def getPlaqAvg(gaugeLinks):
     Ut = gaugeLinks[:,:,0] # Time links (shape: dimx, dimt)
@@ -23,20 +23,20 @@ def getPlaqAvg(gaugeLinks):
     
     return np.mean(np.real(plaq))
     
-def plaqStats(modelObj: schwingerModel, burnIn=1):
+def plaqStats(gaugeConfigs, burnIn=1):
 
-    #loop over all configs in modelObj to get plaq averages
-    plaqAvgs = np.zeros(modelObj.metroSteps)
+    #loop over every config in the ensemble to get plaq averages
+    plaqAvgs = np.zeros(len(gaugeConfigs))
 
-    for i in range(modelObj.metroSteps):
-        plaqAvgs[i] = getPlaqAvg(modelObj.linkHistory[i])
+    for i in range(len(gaugeConfigs)):
+        plaqAvgs[i] = getPlaqAvg(gaugeConfigs[i])
     
     burnedInAvgs = plaqAvgs[burnIn:]
 
     return np.array([np.mean(burnedInAvgs),np.std(burnedInAvgs)/np.sqrt(len(burnedInAvgs))])
 
 
-def correlStats(modelObj: schwingerModel, burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0,-1j]]),
+def correlStats(modelSettings: LatticeParams, gaugeConfigs, burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0,-1j]]),
                  includeDisc = False, chemicalPot = 0, k=0,
                    smearing=False, kappa=.1, smearingSteps=1):
     """Compute the ensemble-averaged meson correlator with bootstrap errors.
@@ -48,8 +48,11 @@ def correlStats(modelObj: schwingerModel, burnIn,autocorrSkip=1, Gamma=np.array(
 
     Parameters
     ----------
-    modelObj : schwingerModel
-        Lattice model containing gauge link history and parameters.
+    modelSettings : LatticeParams
+        Lattice settings
+    gaugeConfigs
+        All of the gauge configurations that will be analyzed.
+        The array should contain the entire history.
     burnIn : int
         Number of initial configurations to discard as thermalization.
     autocorrSkip : int
@@ -76,19 +79,21 @@ def correlStats(modelObj: schwingerModel, burnIn,autocorrSkip=1, Gamma=np.array(
         mean   : (dimt,) array, real part of the weighted-average correlator.
         errors : (2, dimt) array, [upper, lower] 95% bootstrap CI half-widths.
     """
+    metroSteps = len(gaugeConfigs)
+
     acceptedCorrel_conn = []
     acceptedCorrel_disc = []
     source_trace = []
 
     #weights for chemicalPot
-    weightsMu = reweighting.getWeightingFactors(modelObj, chemicalPot, burnIn,  autocorrSkip)
+    weightsMu = reweighting.getWeightingFactors(modelSettings, gaugeConfigs, chemicalPot, burnIn,  autocorrSkip)
 
     #if k!=0, then each config will show up twice, so we need to repeat the weights
     if(k!=0):
         weightsMu = np.repeat(weightsMu,2)
 
-    for i in tqdm(range(burnIn,modelObj.metroSteps,autocorrSkip)):
-        Cconn, Cdisc, sTrace = getCorrelation(modelObj, modelObj.linkHistory[i],Gamma, k=k,
+    for i in tqdm(range(burnIn,metroSteps,autocorrSkip)):
+        Cconn, Cdisc, sTrace = getCorrelation(modelSettings, gaugeConfigs[i],Gamma, k=k,
                                               smearing=smearing, kappa=kappa, smearingSteps=smearingSteps)
         
         acceptedCorrel_conn.append(Cconn)
@@ -96,7 +101,7 @@ def correlStats(modelObj: schwingerModel, burnIn,autocorrSkip=1, Gamma=np.array(
         source_trace.append(sTrace)
 
         if(k!=0):
-            Cconn, Cdisc, sTrace = getCorrelation(modelObj, modelObj.linkHistory[i],Gamma, k=-k,
+            Cconn, Cdisc, sTrace = getCorrelation(modelSettings, gaugeConfigs[i],Gamma, k=-k,
                                               smearing=smearing, kappa=kappa, smearingSteps=smearingSteps)
         
             acceptedCorrel_conn.append(Cconn)
@@ -111,7 +116,7 @@ def correlStats(modelObj: schwingerModel, burnIn,autocorrSkip=1, Gamma=np.array(
     mean_vev = np.average(source_trace, axis=0, weights=weightsMu)
 
     if(includeDisc):
-        totalCorrels = acceptedCorrel_conn + acceptedCorrel_disc - modelObj.dimx *(mean_vev*np.conjugate(mean_vev))
+        totalCorrels = acceptedCorrel_conn + acceptedCorrel_disc - modelSettings.dimx *(mean_vev*np.conjugate(mean_vev))
     else:
         totalCorrels = acceptedCorrel_conn
 
@@ -138,17 +143,19 @@ def correlStats(modelObj: schwingerModel, burnIn,autocorrSkip=1, Gamma=np.array(
 
     return [totalCorrelMean, np.array([high-totalCorrelMean, totalCorrelMean-low])]
 
-def effectiveMassStats(modelObj,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0,-1j]]), includeDisc = True, coshExpr = True, cleanNans = False, chemicalPot = 0):
+def effectiveMassStats(modelSettings:LatticeParams,gaugeConfigs,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0,-1j]]), includeDisc = True, coshExpr = True, cleanNans = False, chemicalPot = 0):
+    metroSteps=len(gaugeConfigs)
+
     acceptedCorrel_conn = []
     acceptedCorrel_disc = []
     source_trace = []
 
     #weights for chemicalPot
 
-    weightsMu = reweighting.getWeightingFactors(modelObj,chemicalPot, burnIn,  autocorrSkip)
+    weightsMu = reweighting.getWeightingFactors(modelSettings,gaugeConfigs, chemicalPot, burnIn,  autocorrSkip)
 
-    for i in tqdm(range(burnIn,modelObj.metroSteps,autocorrSkip)):
-        Cconn, Cdisc, sTrace = getCorrelation(modelObj,modelObj.linkHistory[i],Gamma)
+    for i in tqdm(range(burnIn,metroSteps,autocorrSkip)):
+        Cconn, Cdisc, sTrace = getCorrelation(modelSettings,gaugeConfigs[i],Gamma)
         
         acceptedCorrel_conn.append(Cconn)
         acceptedCorrel_disc.append(Cdisc)
@@ -161,7 +168,7 @@ def effectiveMassStats(modelObj,burnIn,autocorrSkip=1, Gamma=np.array([[1j,0],[0
     mean_vev = np.average(source_trace, axis=0, weights=weightsMu)
 
     if(includeDisc):
-        totalCorrels = acceptedCorrel_conn + acceptedCorrel_disc - modelObj.dimx *(mean_vev*np.conjugate(mean_vev))
+        totalCorrels = acceptedCorrel_conn + acceptedCorrel_disc - modelSettings.dimx *(mean_vev*np.conjugate(mean_vev))
     else:
         totalCorrels = acceptedCorrel_conn
 
@@ -254,13 +261,15 @@ def effectiveMassProp(correlStats, coshExpr=False):
     return [effectiveMass,effectiveMassErr]
 
 
-def numDensityStats(modelObj, burnIn, autocorrSkip=1, chemicalPot=0.0):
-    V = modelObj.a**2*modelObj.dimx * modelObj.dimt
+def numDensityStats(modelSettings: LatticeParams, gaugeConfigs, burnIn, autocorrSkip=1, chemicalPot=0.0):
+    metroSteps = len(gaugeConfigs)
+
+    V = modelSettings.a**2*modelSettings.dimx * modelSettings.dimt
 
     # reweighting factors for finite mu
     #weights for chemicalPot
 
-    weights = reweighting.getWeightingFactors(modelObj,chemicalPot, burnIn,  autocorrSkip)
+    weights = reweighting.getWeightingFactors(modelSettings,gaugeConfigs,chemicalPot, burnIn,  autocorrSkip)
 
     #get a sense of where reweighting is valid
     validity = (np.abs(np.average(weights))/np.average(np.abs(weights)))
@@ -268,15 +277,15 @@ def numDensityStats(modelObj, burnIn, autocorrSkip=1, chemicalPot=0.0):
     n_mu_samples = []
     n_0_samples  = []   # vacuum subtraction
 
-    for i in tqdm(range(burnIn, modelObj.metroSteps, autocorrSkip)):
-        links = modelObj.linkHistory[i]
+    for i in tqdm(range(burnIn, metroSteps, autocorrSkip)):
+        links = gaugeConfigs[i]
 
-        D_mu = np.linalg.inv(ops.buildDiracOp(modelObj, links, chemicalPot).toarray())
-        D_0  = np.linalg.inv(ops.buildDiracOp(modelObj, links, 0.0).toarray())
+        D_mu = np.linalg.inv(ops.buildDiracOp(modelSettings, links, chemicalPot).toarray())
+        D_0  = np.linalg.inv(ops.buildDiracOp(modelSettings, links, 0.0).toarray())
 
         # keep n sparse: Tr(S·n) = n.multiply(S.T).sum() is O(nnz) not O(N³)
-        n_mu = ops.buildNumberDensOp(modelObj, links, chemicalPot)
-        n_0  = ops.buildNumberDensOp(modelObj, links, 0.0)
+        n_mu = ops.buildNumberDensOp(modelSettings, links, chemicalPot)
+        n_0  = ops.buildNumberDensOp(modelSettings, links, 0.0)
 
         n_mu_samples.append(n_mu.multiply(D_mu.T).sum() / V)
         n_0_samples.append(n_0.multiply(D_0.T).sum() / V)
@@ -309,20 +318,20 @@ def numDensityStats(modelObj, burnIn, autocorrSkip=1, chemicalPot=0.0):
     return [np.real(mean), np.real(np.array([high-mean, mean-low])), validity]
 
 
-def getCorrelation(modelObj,gaugeLinks,Gamma=np.array([[1j,0],[0,-1j]]), k=0, smearing=False, kappa= .1, smearingSteps=1):
+def getCorrelation(modelSetting: LatticeParams,gaugeLinks,Gamma=np.array([[1j,0],[0,-1j]]), k=0, smearing=False, kappa= .1, smearingSteps=1):
 
     if(smearing):
-        prop = ops.smearedPropagator(modelObj, gaugeLinks, kappa, smearingSteps)
+        prop = ops.smearedPropagator(modelSetting, gaugeLinks, kappa, smearingSteps)
     else:
-        dOp = ops.buildDiracOp(modelObj, gaugeLinks)
+        dOp = ops.buildDiracOp(modelSetting, gaugeLinks)
 
         prop = np.linalg.inv(dOp.toarray())
 
-    stridex = modelObj.dimt*2
+    stridex = modelSetting.dimt*2
     stridet = 2
 
-    correl_conn = np.zeros(modelObj.dimt,dtype=np.complex128)
-    correl_disc = np.zeros(modelObj.dimt)
+    correl_conn = np.zeros(modelSetting.dimt,dtype=np.complex128)
+    correl_disc = np.zeros(modelSetting.dimt)
 
     #t_n/x_n will always be set at zero for now
 
@@ -330,10 +339,10 @@ def getCorrelation(modelObj,gaugeLinks,Gamma=np.array([[1j,0],[0,-1j]]), k=0, sm
     x_n=0
 
     # Store the local trace Tr[Gamma S(x,t; x,t)] for every point
-    local_traces = np.zeros((modelObj.dimt, modelObj.dimx), dtype=complex)
+    local_traces = np.zeros((modelSetting.dimt, modelSetting.dimx), dtype=complex)
 
-    for t in range(modelObj.dimt):           
-        for x in range(modelObj.dimx):
+    for t in range(modelSetting.dimt):           
+        for x in range(modelSetting.dimx):
             idx_start = x * stridex + t * stridet
             idx_end = idx_start + 2
             propxx = prop[idx_start:idx_end, idx_start:idx_end]
@@ -346,15 +355,15 @@ def getCorrelation(modelObj,gaugeLinks,Gamma=np.array([[1j,0],[0,-1j]]), k=0, sm
     spatial_summed_traces = np.sum(local_traces, axis=1)
 
     #loop over changes in time
-    for delta_t in range(modelObj.dimt):
+    for delta_t in range(modelSetting.dimt):
         
         #Diconnected part
         disc_sum = 0
         #shift to all times to collect all possible products for disconnected part
-        for t_src in range(modelObj.dimt):
-            t_sink = (t_src+delta_t)%modelObj.dimt
+        for t_src in range(modelSetting.dimt):
+            t_sink = (t_src+delta_t)%modelSetting.dimt
             disc_sum+= (spatial_summed_traces[t_sink]*spatial_summed_traces[t_src]).real
-        correl_disc[delta_t] = disc_sum / (modelObj.dimt*modelObj.dimx)
+        correl_disc[delta_t] = disc_sum / (modelSetting.dimt*modelSetting.dimx)
 
         #connected part
         t_n = 0
@@ -362,7 +371,7 @@ def getCorrelation(modelObj,gaugeLinks,Gamma=np.array([[1j,0],[0,-1j]]), k=0, sm
         idx_n_start = x_n * stridex + t_n * stridet
         idx_n_end = idx_n_start + 2
 
-        for x_m in range(modelObj.dimx):
+        for x_m in range(modelSetting.dimx):
 
             idx_m_start = x_m * stridex + delta_t * stridet
             idx_m_end = idx_m_start + 2
@@ -372,13 +381,13 @@ def getCorrelation(modelObj,gaugeLinks,Gamma=np.array([[1j,0],[0,-1j]]), k=0, sm
             propmn = prop[idx_m_start:idx_m_end, idx_n_start:idx_n_end]
 
             #include momentum projection
-            correl_conn[delta_t]+=-np.trace(Gamma@propnm@Gamma@propmn)*np.exp(-1j*2*np.pi*k*x_m/modelObj.dimx)
+            correl_conn[delta_t]+=-np.trace(Gamma@propnm@Gamma@propmn)*np.exp(-1j*2*np.pi*k*x_m/modelSetting.dimx)
     
     #return both connected and disconnected part
     return np.real(correl_conn), correl_disc, trace_source_avg
 
 
-def getNumDensityRhoBar(modelObj: schwingerModel, burnIn=0, chemicalPot=0.0):
+def getNumDensityRhoBar(modelSettings: LatticeParams, gaugeConfigs, burnIn=0, chemicalPot=0.0):
     """Compute the normalized autocorrelation function rhoBar for the number density.
 
     Iterates over every post-burn-in configuration (no thinning — thinning
@@ -392,8 +401,11 @@ def getNumDensityRhoBar(modelObj: schwingerModel, burnIn=0, chemicalPot=0.0):
 
     Parameters
     ----------
-    modelObj : schwingerModel
-        Lattice model containing gauge link history and parameters.
+    modelSettings : LatticeParams
+        Lattice settings
+    gaugeConfigs
+        All of the gauge configurations that will be analyzed.
+        The array should contain the entire history.
     burnIn : int
         Number of initial configurations to discard as thermalization.
     chemicalPot : float
@@ -405,23 +417,23 @@ def getNumDensityRhoBar(modelObj: schwingerModel, burnIn=0, chemicalPot=0.0):
         Normalized autocorrelation function.  Pass this together with
         ``N_conf = len(rhoBar)`` to ``get_integrated_autocorr_time_statistical``.
     """
-    V = modelObj.a**2 * modelObj.dimx * modelObj.dimt
+    V = modelSettings.a**2 * modelSettings.dimx * modelSettings.dimt
 
     n_mu_samples = []
     n_0_samples  = []
     weights      = []
 
-    for i in tqdm(range(burnIn, modelObj.metroSteps)):
-        links = modelObj.linkHistory[i]
+    for i in tqdm(range(burnIn, len(gaugeConfigs))):
+        links = gaugeConfigs[i]
 
-        dOp   = ops.buildDiracOp(modelObj, links).toarray()
-        dOpmu = ops.buildDiracOp(modelObj, links, chemicalPot).toarray()
+        dOp   = ops.buildDiracOp(modelSettings, links).toarray()
+        dOpmu = ops.buildDiracOp(modelSettings, links, chemicalPot).toarray()
 
         D_mu = np.linalg.inv(dOpmu)
         D_0  = np.linalg.inv(dOp)
 
-        n_mu = ops.buildNumberDensOp(modelObj, links, chemicalPot)
-        n_0  = ops.buildNumberDensOp(modelObj, links, 0.0)
+        n_mu = ops.buildNumberDensOp(modelSettings, links, chemicalPot)
+        n_0  = ops.buildNumberDensOp(modelSettings, links, 0.0)
 
         n_mu_samples.append(n_mu.multiply(D_mu.T).sum() / V)
         n_0_samples.append(n_0.multiply(D_0.T).sum() / V)

@@ -1,4 +1,3 @@
-from .schwingerModel import schwingerModel
 from . import reweighting
 from . import analysis
 from . import buildOps
@@ -8,3 +7,8 @@ from . import interpolator
 from . import wick
 from . import evaluator
 from . import topology
+from . import params
+from . import hmc
+from . import hmc_gpu
+from . import experiment
+from . import plotting

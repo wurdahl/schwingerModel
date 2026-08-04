@@ -1,6 +1,6 @@
 #gauge generation input for run_sim.py
 
-outputFile = "configs/beta_3_m0_0.2_Nx_10_Nt_32.pkl"
+outputFile = "configs/beta_3_m0_0.2_Nx_10_Nt_32.h5"
 
 [physics]
 beta = 3.0
@@ -28,4 +28,4 @@ cgRtol = 1e-5         #optional CG tolerance
 targetAcceptance = 0.99
 pilotSteps = 100
 startSubSteps = 5
-jmaxSubSteps = 500
+maxSubSteps = 500

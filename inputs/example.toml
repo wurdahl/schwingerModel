@@ -1,7 +1,7 @@
 #gauge generation input for run_sim.py:  python run_sim.py inputs/example.toml
 #(values here reproduce the ryanComp ensemble)
 
-outputFile = "configs/ryanComp.pkl"
+outputFile = "configs/ryanComp.h5"
 
 [physics]
 beta = 2.0

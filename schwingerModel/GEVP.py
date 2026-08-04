@@ -312,7 +312,9 @@ def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
 
     Returns:
         np.ndarray: [E, dE, logA, dlogA] — energy, its profiled (marginal)
-        error, log-amplitude, and its error.
+        error, log-amplitude, and its error. All NaN (with a warning) if the
+        window has no positive signal, the bootstrap cov is unavailable, or
+        the fit fails — callers can plot the surviving states unconditionally.
     """
     dimt = gevpStatsOut[0].shape[0] + ti
 
@@ -328,6 +330,12 @@ def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
         return logA + numer - denom
 
     mean = gevpStatsOut[0][fitT[0]:fitT[1], eigenIdx]
+    if (gevpStatsOut[2] is None or not np.all(np.isfinite(mean))
+            or np.any(mean <= 0)):
+        import warnings
+        warnings.warn(f"gevpMassExtract: no usable signal for state {eigenIdx} "
+                      f"in window {fitT}; returning NaNs")
+        return np.full(4, np.nan)
     cov  = gevpStatsOut[2][eigenIdx, fitT[0]:fitT[1], fitT[0]:fitT[1]]
 
     log_mean = np.log(mean)
@@ -335,9 +343,15 @@ def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
     log_cov  = cov * np.outer(inv_mean, inv_mean)
 
     model = coshCorrel_log if coshExpr else expDecay_log
-    fitMass = curve_fit(model, xdata=np.arange(fitT[0], fitT[1]),
-                ydata=log_mean, sigma=log_cov, absolute_sigma=True,
-                p0=[0.5, 0.0], bounds=([0, -np.inf], [np.inf, np.inf]))
+    try:
+        fitMass = curve_fit(model, xdata=np.arange(fitT[0], fitT[1]),
+                    ydata=log_mean, sigma=log_cov, absolute_sigma=True,
+                    p0=[0.5, 0.0], bounds=([0, -np.inf], [np.inf, np.inf]))
+    except Exception as fitErr:
+        import warnings
+        warnings.warn(f"gevpMassExtract: fit failed for state {eigenIdx} "
+                      f"in window {fitT} ({fitErr}); returning NaNs")
+        return np.full(4, np.nan)
 
     # [E, dE, logA, dlogA] — dE is the profiled (marginal) mass error
     return np.array([fitMass[0][0], np.sqrt(fitMass[1][0, 0]),

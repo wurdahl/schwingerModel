@@ -4,27 +4,26 @@ Gauge configuration generation driven by a TOML input file:
     python run_sim.py inputs/example.toml
 
 Runs nChains independent HMC chains in parallel, discards the per-chain burn-in,
-merges the thermalized configurations, and pickles the result. The number of
-HMC substeps is either given explicitly (numSubSteps) or tuned automatically by
-scanning pilot chains until the target metropolis acceptance rate is reached.
-See inputs/example.toml for all recognized fields.
+merges the thermalized configurations, and writes them to an HDF5 ensemble file.
+The number of HMC substeps is either given explicitly (numSubSteps) or tuned
+automatically by scanning pilot chains until the target metropolis acceptance
+rate is reached. See inputs/example.toml for all recognized fields.
 """
 
 import os
 import sys
-import pickle
 import tomllib
 
-import numpy as np
-from joblib import Parallel, delayed
 from tqdm import tqdm
 
-import schwingerModel as sim
+from schwingerModel import experiment
 
 
 def loadInput(path):
     with open(path, 'rb') as f:
         raw = tomllib.load(f)
+
+    run = raw['run']
 
     cfg = {
         #required
@@ -33,16 +32,19 @@ def loadInput(path):
         'fMass': raw['physics']['fMass'],
         'dimx':  raw['lattice']['dimx'],
         'dimt':  raw['lattice']['dimt'],
-        'targetConfigs': raw['run']['targetConfigs'],
-        'burnIn':        raw['run']['burnIn'],
+        #total metropolis steps across all chains (older inputs spell this targetConfigs)
+        'metroSteps': run.get('metroSteps', run.get('targetConfigs')),
+        'burnIn':     run['burnIn'],
         #optional
         'aSpacing': raw['physics'].get('aSpacing', 1.0),
-        'cgRtol':   raw['run'].get('cgRtol', 1e-5),
-        'randSeed': raw['run'].get('randSeed', 0),
-        'nCores':   raw['run'].get('nCores', os.cpu_count()),
-        'tunneling': raw['run'].get('tunneling', False),
+        'cgRtol':   run.get('cgRtol', 1e-5),
+        'randSeed': run.get('randSeed', 0),
+        'nCores':   run.get('nCores', os.cpu_count()),
+        'tunneling': run.get('tunneling', False),
     }
-    cfg['nChains'] = raw['run'].get('nChains', cfg['nCores'])
+    if cfg['metroSteps'] is None:
+        raise KeyError(f"{path} sets neither run.metroSteps nor run.targetConfigs")
+    cfg['nChains'] = run.get('nChains', cfg['nCores'])
 
     sub = raw.get('substeps', {})
     cfg['numSubSteps']      = sub.get('numSubSteps')        # None -> tune automatically
@@ -57,14 +59,14 @@ def loadInput(path):
 def pilotAcceptance(cfg, numSubSteps):
     """Acceptance rate of a short pilot chain, measured on its second half
     so the cold-start transient does not bias the estimate."""
-    model = sim.schwingerModel(
-        metroSteps=cfg['pilotSteps'],
-        beta=cfg['beta'], dimx=cfg['dimx'], dimt=cfg['dimt'],
-        aSpacing=cfg['aSpacing'], fMass=cfg['fMass'], cgRtol=cfg['cgRtol'],
-        randSeed=cfg['randSeed'], numSubSteps=numSubSteps,
+    accept, _ = experiment.acceptanceFractions(
+        beta=cfg['beta'], fMass=cfg['fMass'], aSpacing=cfg['aSpacing'],
+        Nx=cfg['dimx'], Nt=cfg['dimt'],
+        metroSteps=cfg['pilotSteps'], numSubSteps=numSubSteps,
+        tunneling=cfg['tunneling'], cgRtol=cfg['cgRtol'], seed=cfg['randSeed'],
         tqdmPosition=1,   #keep the pilot bar below the tuning report lines
     )
-    return np.mean(model.acceptHistory[cfg['pilotSteps']//2:])
+    return accept
 
 
 def tuneSubSteps(cfg):
@@ -101,24 +103,12 @@ def tuneSubSteps(cfg):
     return hi
 
 
-def runChain(cfg, chainIndex, numSubSteps, stepsPerChain):
-    model = sim.schwingerModel(
-        metroSteps=cfg['burnIn'] + stepsPerChain,
-        beta=cfg['beta'], dimx=cfg['dimx'], dimt=cfg['dimt'],
-        aSpacing=cfg['aSpacing'], fMass=cfg['fMass'], cgRtol=cfg['cgRtol'],
-        randSeed=cfg['randSeed'] + chainIndex, tqdmPosition=chainIndex,
-        numSubSteps=numSubSteps,tunneling=cfg['tunneling']
-    )
-    #chain 0 carries the model object; the rest only their thermalized history
-    if chainIndex == 0:
-        return model
-    return (model.linkHistory[cfg['burnIn']:],
-            model.acceptHistory[cfg['burnIn']:],
-            model.tunnelAcceptance[cfg['burnIn']:])
-
-
 def main(inputPath):
     cfg = loadInput(inputPath)
+
+    #checked up front: saveEnsemble would also refuse, but only after the chains have run
+    if os.path.exists(cfg['outputFile']):
+        sys.exit(f"{cfg['outputFile']} already exists; move it or change outputFile")
 
     if cfg['numSubSteps'] is not None:
         numSubSteps = cfg['numSubSteps']
@@ -128,34 +118,19 @@ def main(inputPath):
         numSubSteps = tuneSubSteps(cfg)
         print(f"using {numSubSteps} substeps")
 
-    stepsPerChain = -(-cfg['targetConfigs'] // cfg['nChains'])   # ceil division
+    stepsPerChain = -(-cfg['metroSteps'] // cfg['nChains'])   # ceil division
+    print(f"running {cfg['nChains']} chains x ({cfg['burnIn']} burn-in + {stepsPerChain} configs)")
 
-    print(f"running {cfg['nChains']} chains x ({cfg['burnIn']} burn-in + {stepsPerChain} configs) "
-          f"on {cfg['nCores']} cores")
+    experiment.runExperiment(
+        cfg['outputFile'],
+        beta=cfg['beta'], fMass=cfg['fMass'], aSpacing=cfg['aSpacing'],
+        Nx=cfg['dimx'], Nt=cfg['dimt'],
+        metroSteps=cfg['metroSteps'], numSubSteps=numSubSteps,
+        tunneling=cfg['tunneling'], cores=cfg['nCores'], chains=cfg['nChains'],
+        perChainBurnIn=cfg['burnIn'], cgRtol=cfg['cgRtol'], randSeed=cfg['randSeed'],
+    )
 
-    results = Parallel(n_jobs=cfg['nCores'])(
-        delayed(runChain)(cfg, i, numSubSteps, stepsPerChain) for i in range(cfg['nChains']))
-
-    base = results[0]
-    nKeep = cfg['targetConfigs']
-    merged = np.concatenate([base.linkHistory[cfg['burnIn']:]] + [r[0] for r in results[1:]])[:nKeep]
-    mergedAccept = np.concatenate([base.acceptHistory[cfg['burnIn']:]] + [r[1] for r in results[1:]])[:nKeep]
-    mergedTunnel = np.concatenate([base.tunnelAcceptance[cfg['burnIn']:]] + [r[2] for r in results[1:]])[:nKeep]
-
-    base.linkHistory = merged
-    base.metroSteps = len(merged)
-    #per-config accept flags survive the merge; only autocorrelation across chain boundaries is meaningless
-    base.acceptHistory = mergedAccept
-    base.tunnelAcceptance = mergedTunnel
-
-    if cfg['tunneling']:
-        print(f"tunnel step acceptance: {mergedTunnel.mean():.3f}")
-
-    os.makedirs(os.path.dirname(cfg['outputFile']) or '.', exist_ok=True)
-    with open(cfg['outputFile'], 'wb') as f:
-        pickle.dump(base, f)
-
-    print(f"saved {len(merged)} configurations to {cfg['outputFile']}")
+    print(f"saved {cfg['metroSteps']} configurations to {cfg['outputFile']}")
 
 
 if __name__ == '__main__':

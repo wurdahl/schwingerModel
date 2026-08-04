@@ -2,11 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .schwingerModel import schwingerModel
-
 def instanton(Q, Lx, Lt):
     x = np.arange(Lx)
     t = np.arange(Lt)
@@ -35,10 +30,10 @@ def getTopoQ(links):
 
     return Q
 
-def getAllTopoQs(modelObj: schwingerModel):
-    Qs = np.zeros(modelObj.metroSteps)
+def getAllTopoQs(gaugeConfigs):
+    Qs = np.zeros(len(gaugeConfigs))
 
-    for i in range(modelObj.metroSteps):
-        Qs[i] = getTopoQ(modelObj.linkHistory[i])
+    for i in range(len(gaugeConfigs)):
+        Qs[i] = getTopoQ(gaugeConfigs[i])
 
     return Qs

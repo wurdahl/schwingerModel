@@ -1,6 +1,6 @@
 #gauge generation input for run_sim.py
 
-outputFile = "configs/beta_3_m0_0.2_Nx_10_Nt_32_melted.pkl"
+outputFile = "configs/beta_3_m0_0.2_Nx_10_Nt_32_melted.h5"
 
 [physics]
 beta = 3.0
@@ -29,4 +29,4 @@ tunneling = true      #optional topological tunneling boost
 targetAcceptance = 0.99
 pilotSteps = 100
 startSubSteps = 5
-jmaxSubSteps = 500
+maxSubSteps = 500

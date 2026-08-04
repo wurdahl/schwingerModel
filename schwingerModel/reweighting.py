@@ -11,26 +11,22 @@ from __future__ import annotations
 
 import numpy as np
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .schwingerModel import schwingerModel
-
+from .params import LatticeParams
 from . import buildOps as ops
 from . import topology as top
 
 
-def getWeightingFactors(modelObj: schwingerModel, chemicalPot=1, burnIn=1, autocorrSkip=10):
+def getWeightingFactors(modelSettings: LatticeParams, gaugeConfigs, chemicalPot=1, burnIn=1, autocorrSkip=10):
     """det-ratio reweighting from mu=0 to chemicalPot, squared for two degenerate flavors."""
     if(chemicalPot==0):
-        return np.ones(len(np.arange(burnIn,modelObj.metroSteps,autocorrSkip)))
+        return np.ones(len(np.arange(burnIn,len(gaugeConfigs),autocorrSkip)))
 
     weights = []
 
-    for i in range(burnIn,modelObj.metroSteps,autocorrSkip):
-        currLinks = modelObj.linkHistory[i]
-        dOp = ops.buildDiracOp(modelObj, currLinks).toarray()
-        dOpmu = ops.buildDiracOp(modelObj, currLinks, chemicalPot).toarray()
+    for i in range(burnIn,len(gaugeConfigs),autocorrSkip):
+        currLinks = gaugeConfigs[i]
+        dOp = ops.buildDiracOp(modelSettings, currLinks).toarray()
+        dOpmu = ops.buildDiracOp(modelSettings, currLinks, chemicalPot).toarray()
 
         sign_0, logdet_0 = np.linalg.slogdet(dOp)
         sign_mu, logdet_mu = np.linalg.slogdet(dOpmu)
@@ -40,18 +36,19 @@ def getWeightingFactors(modelObj: schwingerModel, chemicalPot=1, burnIn=1, autoc
     return np.array(weights)**2
 
 
-def getWeightingFactorsTheta(modelObj: schwingerModel, theta=0, burnIn=1, autocorrSkip=10):
-    """exp(i theta Q) reweighting from the theta=0 ensemble, Q from plaquette angles."""
+def getWeightingFactorsTheta(Qs, theta=0, burnIn=1, autocorrSkip=10):
+    """
+    exp(i theta Q) reweighting from the theta=0 ensemble.
+
+    Takes the per-config topological charges directly — distillation v2 files
+    store them (readDistillMeta().Q), so this needs no gauge links. For a raw
+    ensemble use topology.getAllTopoQs(gaugeConfigs) to produce them.
+    """
+    Qs = np.asarray(Qs)[burnIn::autocorrSkip]
+
     if(theta == 0):
-        return np.ones(len(np.arange(burnIn,modelObj.metroSteps,autocorrSkip)))
+        return np.ones(len(Qs))
 
-    weights = []
-
-    for i in range(burnIn, modelObj.metroSteps, autocorrSkip):
-        currLinks = modelObj.linkHistory[i]
-
-        weights.append(top.getTopoQ(currLinks))
-
-    return np.exp(1j*theta*np.array(weights))
+    return np.exp(1j*theta*Qs)
 
 

@@ -1,6 +1,6 @@
 #gauge generation input for run_sim.py
 
-outputFile = "configs/50kSteps_melted.pkl"
+outputFile = "configs/50kSteps_melted.h5"
 
 [physics]
 beta = 10
@@ -29,4 +29,4 @@ numSubSteps = 33
 #targetAcceptance = 0.95
 #pilotSteps = 100
 #startSubSteps = 5
-#jmaxSubSteps = 500
+#maxSubSteps = 500

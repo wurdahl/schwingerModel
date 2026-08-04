@@ -6,28 +6,25 @@ from scipy.stats import bootstrap
 from scipy.optimize import curve_fit
 from tqdm import tqdm
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .schwingerModel import schwingerModel
+from .params import LatticeParams
 
 #builds the dirac operator using the global gaugeLinks configuration
 # matrix is a square matrix with dimensional ordering (space, time, spin) 
-def buildDiracOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
+def buildDiracOp(modelSettings: LatticeParams, gaugeLinks, chemicalPot=0):
     #dirac dimensions
     dimD = 2
     eyeD = np.eye(dimD)
 
-    shift_x_1Dpos = np.roll(np.eye(modelObj.dimx), -1, axis=0) # This is \delta_{x_n+1, x_m}
-    shift_t_1Dpos = np.roll(np.eye(modelObj.dimt), -1, axis=0)
-    shift_x_1Dneg = np.roll(np.eye(modelObj.dimx), +1, axis=0) # This is \delta_{x_n-1, x_m}
-    shift_t_1Dneg = np.roll(np.eye(modelObj.dimt), +1, axis=0)
-    time_identity = sparse.eye_array(modelObj.dimt)                      # This is \delta_{t_n, t_m}
-    space_identity = sparse.eye_array(modelObj.dimx)
+    shift_x_1Dpos = np.roll(np.eye(modelSettings.dimx), -1, axis=0) # This is \delta_{x_n+1, x_m}
+    shift_t_1Dpos = np.roll(np.eye(modelSettings.dimt), -1, axis=0)
+    shift_x_1Dneg = np.roll(np.eye(modelSettings.dimx), +1, axis=0) # This is \delta_{x_n-1, x_m}
+    shift_t_1Dneg = np.roll(np.eye(modelSettings.dimt), +1, axis=0)
+    time_identity = sparse.eye_array(modelSettings.dimt)                      # This is \delta_{t_n, t_m}
+    space_identity = sparse.eye_array(modelSettings.dimx)
 
     #anti-periodic boundary conditions for fermions in time
-    shift_t_1Dpos[modelObj.dimt - 1, 0] = -1.0
-    shift_t_1Dneg[0, modelObj.dimt - 1] = -1.0
+    shift_t_1Dpos[modelSettings.dimt - 1, 0] = -1.0
+    shift_t_1Dneg[0, modelSettings.dimt - 1] = -1.0
 
     #space-time shift operators
     T_x_pos = sparse.kron(shift_x_1Dpos, time_identity)
@@ -40,33 +37,33 @@ def buildDiracOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
     timeLinks = sparse.diags_array(gaugeLinks[:,:,0].flatten())
 
     #start building dirac operator matrix
-    Dee = (modelObj.fMass+2/modelObj.a)*sparse.kron(space_identity, sparse.kron(time_identity,eyeD))
+    Dee = (modelSettings.fMass+2/modelSettings.a)*sparse.kron(space_identity, sparse.kron(time_identity,eyeD))
     #positive shifts
-    Dee-=1/(2*modelObj.a) * sparse.kron(spaceLinks@T_x_pos, eyeD-modelObj.gammax)
-    Dee-=1/(2*modelObj.a) * sparse.kron(timeLinks@T_t_pos, eyeD-modelObj.gammat)*np.exp(modelObj.a*chemicalPot)
+    Dee-=1/(2*modelSettings.a) * sparse.kron(spaceLinks@T_x_pos, eyeD-modelSettings.gammax)
+    Dee-=1/(2*modelSettings.a) * sparse.kron(timeLinks@T_t_pos, eyeD-modelSettings.gammat)*np.exp(modelSettings.a*chemicalPot)
     #negative shifts
-    Dee-=1/(2*modelObj.a) * sparse.kron(T_x_neg@(spaceLinks.conj()),eyeD+modelObj.gammax)
-    Dee-=1/(2*modelObj.a) * sparse.kron(T_t_neg@(timeLinks.conj()),eyeD+modelObj.gammat)*np.exp(-modelObj.a*chemicalPot)
+    Dee-=1/(2*modelSettings.a) * sparse.kron(T_x_neg@(spaceLinks.conj()),eyeD+modelSettings.gammax)
+    Dee-=1/(2*modelSettings.a) * sparse.kron(T_t_neg@(timeLinks.conj()),eyeD+modelSettings.gammat)*np.exp(-modelSettings.a*chemicalPot)
 
     return Dee
 
-def applyCovDerivative(modelObj, gaugeLinks, fields):
+def applyCovDerivative(modelSettings: LatticeParams, gaugeLinks, fields):
     """Symmetric covariant derivative on fields of shape (N_t, N_x, N_vec)."""
     U  = gaugeLinks[:, :, 1].T[:, :, None]                    # (N_t, N_x, 1)
     Um = np.roll(np.conj(U), 1, axis=1)                       # U*_{x-1}
     return (U * np.roll(fields, -1, axis=1)
-            - Um * np.roll(fields, 1, axis=1)) / (2 * modelObj.a)
+            - Um * np.roll(fields, 1, axis=1)) / (2 * modelSettings.a)
 
 
-def buildLaplacian(modelObj: schwingerModel, gaugeLinks, nt):
+def buildLaplacian(modelSettings: LatticeParams, gaugeLinks, nt):
     """
     Creates the gauge-covariant laplacian at time slice nt (no spin index)
     """
 
     #dirac dimensions
 
-    shift_x_1Dpos = np.roll(np.eye(modelObj.dimx), -1, axis=0) # This is \delta_{x_n+1, x_m}
-    shift_x_1Dneg = np.roll(np.eye(modelObj.dimx), +1, axis=0) # This is \delta_{x_n+1, x_m}
+    shift_x_1Dpos = np.roll(np.eye(modelSettings.dimx), -1, axis=0) # This is \delta_{x_n+1, x_m}
+    shift_x_1Dneg = np.roll(np.eye(modelSettings.dimx), +1, axis=0) # This is \delta_{x_n+1, x_m}
 
     #flattened gaugelinks: [:,nt, 1] are spatial links at timeslice t
     spaceLinks = sparse.diags_array(gaugeLinks[:,nt,1].flatten())
@@ -74,22 +71,22 @@ def buildLaplacian(modelObj: schwingerModel, gaugeLinks, nt):
     #H matrix for smearing
     H = spaceLinks@shift_x_1Dpos + shift_x_1Dneg@np.conj(spaceLinks)
     #subtract off diagonal
-    H-= 2*sparse.eye_array(modelObj.dimx)
+    H-= 2*sparse.eye_array(modelSettings.dimx)
 
     return H
 
-def buildNumberDensOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
+def buildNumberDensOp(modelSettings: LatticeParams, gaugeLinks, chemicalPot=0):
     #dirac dimensions
     dimD = 2
     eyeD = np.eye(dimD)
 
-    shift_t_1Dpos = np.roll(np.eye(modelObj.dimt), -1, axis=0)
-    shift_t_1Dneg = np.roll(np.eye(modelObj.dimt), +1, axis=0)
-    space_identity = sparse.eye_array(modelObj.dimx)
+    shift_t_1Dpos = np.roll(np.eye(modelSettings.dimt), -1, axis=0)
+    shift_t_1Dneg = np.roll(np.eye(modelSettings.dimt), +1, axis=0)
+    space_identity = sparse.eye_array(modelSettings.dimx)
 
     #anti-periodic boundary conditions for fermions in time
-    shift_t_1Dpos[modelObj.dimt - 1, 0] = -1.0
-    shift_t_1Dneg[0, modelObj.dimt - 1] = -1.0
+    shift_t_1Dpos[modelSettings.dimt - 1, 0] = -1.0
+    shift_t_1Dneg[0, modelSettings.dimt - 1] = -1.0
 
     #space-time shift operators
 
@@ -99,20 +96,20 @@ def buildNumberDensOp(modelObj: schwingerModel, gaugeLinks, chemicalPot=0):
     #flattened gaugelinks
     timeLinks = sparse.diags_array(gaugeLinks[:,:,0].flatten())
 
-    nOp=-1/(2) * sparse.kron(timeLinks@T_t_pos, eyeD-modelObj.gammat)*np.exp(modelObj.a*chemicalPot)
+    nOp=-1/(2) * sparse.kron(timeLinks@T_t_pos, eyeD-modelSettings.gammat)*np.exp(modelSettings.a*chemicalPot)
     #negative shifts
-    nOp+=1/(2) * sparse.kron(T_t_neg@np.conj(timeLinks),eyeD+modelObj.gammat)*np.exp(-modelObj.a*chemicalPot)
+    nOp+=1/(2) * sparse.kron(T_t_neg@np.conj(timeLinks),eyeD+modelSettings.gammat)*np.exp(-modelSettings.a*chemicalPot)
 
     return nOp
 
-def jacobiSmearingH(modelObj: schwingerModel, gaugeLinks):
+def jacobiSmearingH(modelSettings: LatticeParams, gaugeLinks):
     #dirac dimensions
     dimD = 2
     eyeD = np.eye(dimD)
 
-    shift_x_1Dpos = np.roll(np.eye(modelObj.dimx), -1, axis=0) # This is \delta_{x_n+1, x_m}
-    shift_x_1Dneg = np.roll(np.eye(modelObj.dimx), +1, axis=0) # This is \delta_{x_n+1, x_m}
-    time_identity = np.eye(modelObj.dimt)                      # This is \delta_{t_n, t_m}
+    shift_x_1Dpos = np.roll(np.eye(modelSettings.dimx), -1, axis=0) # This is \delta_{x_n+1, x_m}
+    shift_x_1Dneg = np.roll(np.eye(modelSettings.dimx), +1, axis=0) # This is \delta_{x_n+1, x_m}
+    time_identity = np.eye(modelSettings.dimt)                      # This is \delta_{t_n, t_m}
 
     #space-time shift operators
     T_x_pos = sparse.kron(shift_x_1Dpos, time_identity)
@@ -136,9 +133,9 @@ def applyJacobi(H, kappa, smearN, v):
         out += kappa**n * Hn_v
     return out
 
-def jacobiSmearingOp(modelObj: schwingerModel, gaugeLinks, kappa = .1, smearingSteps=1):
+def jacobiSmearingOp(modelSettings: LatticeParams, gaugeLinks, kappa = .1, smearingSteps=1):
 
-    jacobiH = jacobiSmearingH(modelObj, gaugeLinks).tocsc()
+    jacobiH = jacobiSmearingH(modelSettings, gaugeLinks).tocsc()
 
     N = jacobiH.shape[0]
     jacobiM = np.identity(N, dtype=np.complex128)
@@ -152,12 +149,12 @@ def jacobiSmearingOp(modelObj: schwingerModel, gaugeLinks, kappa = .1, smearingS
 
     return jacobiM
 
-def smearedPropagator(modelObj: schwingerModel, gaugeLinks, kappa=.1, smearingSteps=1, chemicalPot=0):
-    Dee = buildDiracOp(modelObj, gaugeLinks, chemicalPot)
+def smearedPropagator(modelSettings: LatticeParams, gaugeLinks, kappa=.1, smearingSteps=1, chemicalPot=0):
+    Dee = buildDiracOp(modelSettings, gaugeLinks, chemicalPot)
 
     fullProp = np.linalg.inv(Dee.toarray())
     
-    jacobiM = jacobiSmearingOp(modelObj, gaugeLinks, kappa, smearingSteps)
+    jacobiM = jacobiSmearingOp(modelSettings, gaugeLinks, kappa, smearingSteps)
 
     smearedProp = jacobiM@fullProp@jacobiM
 

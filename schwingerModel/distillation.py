@@ -28,35 +28,34 @@ def tqdm_joblib(tqdm_object):
         joblib.parallel.BatchCompletionCallBack = old
         tqdm_object.close()
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .schwingerModel import schwingerModel
-
 from . import buildOps as ops
+from . import topology as top
+from .params import LatticeParams
 from .reweighting import getWeightingFactorsTheta
+
+FILE_VERSION = 2   # v2: no links, no gamma attrs, per-config Q
 
 GAMMAS = {"g5":np.array([[1j,0],[0,-1j]]),"gx":np.array([[0,1],[1,0]]),
           "gt":np.array([[0,-1j],[1j,0]]), "id":np.eye(2)}
 
-def findPartialEigenBasis(modelObj: schwingerModel, configIndex = 0, numVecs = 4):
+def findPartialEigenBasis(modelSettings: LatticeParams, gaugeLinks, numVecs = 4):
 
     eigenBases = []
 
-    for nt in range(modelObj.dimt):
-        lap = -ops.buildLaplacian(modelObj, modelObj.linkHistory[configIndex], nt=nt)
+    for nt in range(modelSettings.dimt):
+        lap = -ops.buildLaplacian(modelSettings, gaugeLinks, nt=nt)
 
         #This should find the smallest eigenvalues/eigenvectors of the laplacian
         eigs, eigVecs = sparse.linalg.eigsh(lap, k=numVecs,sigma=0, which='LM')
 
         #momentum projection
-        # eigVecs *= np.exp(-1j*2*np.pi*momk*np.arange(modelObj.dimx)/modelObj.dimx)
+        # eigVecs *= np.exp(-1j*2*np.pi*momk*np.arange(modelSettings.dimx)/modelSettings.dimx)
 
         eigenBases.append(eigVecs)
 
     return np.array(eigenBases) #shape: (dimt, dimx, numVecs)
 
-def buildPerambulator(modelObj: schwingerModel, configIndex: int, eigVecs, chemicalPot=0):
+def buildPerambulator(modelSettings: LatticeParams, gaugeLinks, eigVecs, chemicalPot=0):
     """
     Computes the distillation perambulator for a single gauge configuration.
 
@@ -66,13 +65,11 @@ def buildPerambulator(modelObj: schwingerModel, configIndex: int, eigVecs, chemi
     Spin is kept as separate indices; .reshape(T, T, 2N, 2N) recovers the
     compound (vec-major, spin-minor) layout l*2+s.
     """
-    gaugeLinks = modelObj.linkHistory[configIndex]
-
     # eigVecs shape: (dimt, dimx, numVecs)
 
     N_t, N_x, N_vec = eigVecs.shape
 
-    lu = splu(ops.buildDiracOp(modelObj, gaugeLinks, chemicalPot).tocsc())
+    lu = splu(ops.buildDiracOp(modelSettings, gaugeLinks, chemicalPot).tocsc())
 
     tau = np.zeros((N_t, N_t, N_vec, 2, N_vec, 2), dtype=complex)
 
@@ -91,36 +88,37 @@ def buildPerambulator(modelObj: schwingerModel, configIndex: int, eigVecs, chemi
 
     return tau
 
-def buildElementalSpatial(modelObj: schwingerModel, configIndex: int, eigVecs, DNum=0, momk=0):
+def buildElementalSpatial(modelSettings: LatticeParams, gaugeLinks, eigVecs, DNum=0, momk=0):
     """
     Spatial part of the meson elemental (no spin): V^dag(t) e^{-ikx} D^n V(t),
     shape (N_t, N_vec, N_vec). Gamma matrices are applied at contraction time;
     the barred (source) version is the per-slice conjugate transpose.
+    Only DNum > 0 actually reads the links, via applyCovDerivative.
     """
     W = eigVecs                                               # (N_t, N_x, N_vec)
     for _ in range(DNum):
-        W = ops.applyCovDerivative(modelObj, modelObj.linkHistory[configIndex], W)
+        W = ops.applyCovDerivative(modelSettings, gaugeLinks, W)
 
-    momPhase = np.exp(-1j*2*np.pi*momk*np.arange(modelObj.dimx)/modelObj.dimx)
+    momPhase = np.exp(-1j*2*np.pi*momk*np.arange(modelSettings.dimx)/modelSettings.dimx)
 
     return np.einsum('txl,x,txk->tlk', eigVecs.conj(), momPhase, W)
 
-def buildElemental(modelObj: schwingerModel, configIndex: int, eigVecs, DNum=0,
+def buildElemental(modelSettings: LatticeParams, gaugeLinks, eigVecs, DNum=0,
                    Gamma=np.array([[1j,0],[0,-1j]]), momk=0, bar=False):
     """Full (vec ⊗ spin) elemental in kron form — kept as the independent oracle path."""
-    spatial = buildElementalSpatial(modelObj, configIndex, eigVecs, DNum=DNum, momk=momk)
+    spatial = buildElementalSpatial(modelSettings, gaugeLinks, eigVecs, DNum=DNum, momk=momk)
 
     if bar:
-        gammaBar = modelObj.gammat @ Gamma.conj().T @ modelObj.gammat
+        gammaBar = modelSettings.gammat @ Gamma.conj().T @ modelSettings.gammat
         return np.kron(spatial.conj().transpose(0, 2, 1), gammaBar)
 
     return np.kron(spatial, Gamma)
 
 
-def _measureConfig(modelObj: schwingerModel, configIndex: int, numVecs: int, op: MesonOp,
+def _measureConfig(modelSettings: LatticeParams, gaugeLinks, numVecs: int, op: MesonOp,
                    chemicalPot, disc):
     """Per-config measurement: one workspace, connected 2pt (+ loops if disc)."""
-    ws = DistillWorkspace(modelObj, configIndex, numVecs, chemicalPot=chemicalPot)
+    ws = DistillWorkspace(modelSettings, gaugeLinks, numVecs, chemicalPot=chemicalPot)
     conn = evalTwoPoint(ws, op, op)
     if not disc:
         return conn, None, None
@@ -135,24 +133,33 @@ def _parseElemKey(name):
 
 
 class DistillWorkspace:
-    """Per-config store: eigVecs eagerly, tau and elementals lazily, everything cached."""
-    def __init__(self, modelObj, configIndex, numVecs, chemicalPot=0):
-        self.modelObj, self.configIndex = modelObj, configIndex
+    """
+    Per-config store. Built from links (generation): eigVecs eagerly, tau and
+    elementals computed on demand and cached. Built by `load` (measurement):
+    gaugeLinks is None and everything must already be in the file — nothing is
+    recomputed, so an elemental that was not generated is an error, not a
+    silent (and now impossible) rebuild.
+    """
+    def __init__(self, modelSettings, gaugeLinks, numVecs, chemicalPot=0):
+        self.modelSettings, self.gaugeLinks = modelSettings, gaugeLinks
         self.chemicalPot = chemicalPot
-        self.eigVecs = findPartialEigenBasis(modelObj, configIndex, numVecs)
+        self.eigVecs = findPartialEigenBasis(modelSettings, gaugeLinks, numVecs)
         self._tau, self._elem = None, {}
 
     @property
     def tau(self):
         if self._tau is None:
-            self._tau = buildPerambulator(self.modelObj, self.configIndex,
+            self._tau = buildPerambulator(self.modelSettings, self.gaugeLinks,
                                           self.eigVecs, chemicalPot=self.chemicalPot)
         return self._tau
 
     def elemental(self, op: MesonOp, bar=False):
         key = (op.momk, op.DNum)              # spatial part doesn't depend on gamma
         if key not in self._elem:
-            S = buildElementalSpatial(self.modelObj, self.configIndex, self.eigVecs,
+            if self.gaugeLinks is None:
+                raise KeyError(f"{op} was not generated in this file (stored: "
+                               f"{sorted(self._elem)}); regenerate with momks/DNums covering it")
+            S = buildElementalSpatial(self.modelSettings, self.gaugeLinks, self.eigVecs,
                                       DNum=op.DNum, momk=op.momk)
             if np.abs(S).max() < 1e-10:
                 raise ValueError(f"{op} unsupported by this basis (momentum window)")
@@ -163,7 +170,7 @@ class DistillWorkspace:
     def gamma(self, op: MesonOp, bar=False):
         g = GAMMAS[op.gamma]
         if bar:
-            gt = self.modelObj.gammat
+            gt = self.modelSettings.gammat
             return gt @ g.conj().T @ gt
         return g
 
@@ -171,9 +178,10 @@ class DistillWorkspace:
     def load(cls, filePath, configIndex):
         """
         Rebuild a workspace from a generateDistillFile HDF5 cache. Everything is read
-        eagerly and the file closed before returning. The stub model carries enough
-        metadata (dims, a, gammas, this config's links) that elementals not in the
-        file can still be built lazily against the stored eigenvector basis.
+        eagerly and the file closed before returning. The file attrs carry the full
+        LatticeParams. Links are never read (v2 does not store them), so the result
+        is a pure cache: whatever was generated is available, nothing else.
+        Reads v1 files too — their links dataset is simply ignored.
         """
         with h5py.File(filePath, "r") as f:
             gname = f"cfg{configIndex:05d}"
@@ -181,14 +189,12 @@ class DistillWorkspace:
                 raise KeyError(f"{filePath} has no group {gname}")
             g = f[gname]
 
-            stub = SimpleNamespace(dimx=int(f.attrs["dimx"]), dimt=int(f.attrs["dimt"]),
-                                   a=f.attrs["a"], fMass=f.attrs["fMass"],
-                                   gammat=np.asarray(f.attrs["gammat"]),
-                                   gammax=np.asarray(f.attrs["gammax"]),
-                                   linkHistory={configIndex: g["links"][:]})
+            modelSettings = LatticeParams(dimx=int(f.attrs["dimx"]), dimt=int(f.attrs["dimt"]),
+                                          beta=float(f.attrs["beta"]), fMass=float(f.attrs["fMass"]),
+                                          a=float(f.attrs["a"]))
 
             ws = cls.__new__(cls)
-            ws.modelObj, ws.configIndex, ws.chemicalPot = stub, configIndex, 0
+            ws.modelSettings, ws.gaugeLinks, ws.chemicalPot = modelSettings, None, 0
             ws.eigVecs = g["eigVecs"][:]
             ws._tau = g["peram"][:]
             ws._elem = {_parseElemKey(k): g["elem"][k][:] for k in g["elem"]}
@@ -209,54 +215,72 @@ def evalLoop(ws, op, bar=False):
     return np.einsum("iiasbt,iba,ts->i", ws.tau, ws.elemental(op, bar), ws.gamma(op, bar),
                      optimize=True)
 
-def _generateConfig(modelObj, i, numVecs, momks, DNums):
-    ws = DistillWorkspace(modelObj, i, numVecs)
-    data = {"eigVecs": ws.eigVecs, "links": modelObj.linkHistory[i]}
+def _generateConfig(modelSettings, gaugeLinks, i, numVecs, momks, DNums):
+    ws = DistillWorkspace(modelSettings, gaugeLinks, numVecs)
+    data = {"eigVecs": ws.eigVecs}
     data[f"peram"] = ws.tau
     for k in momks:
         for n in DNums:
             data[f"elem/p{k}_d{n}"] = ws.elemental(MesonOp("g5", n, k))  # gamma irrelevant, spatial stored
-    return i, data
+    #Q is the one thing reweighting needs from the links, so it is stored instead of them
+    return i, data, top.getTopoQ(gaugeLinks)
 
 
-def generateDistillFile(modelObj: schwingerModel, filePath, numVecs, burnIn=0, autocorrSkip=1,
-                        momks=(0,), DNums=(0,), n_jobs=-1):
+def generateDistillFile(ensemblePath, filePath, numVecs,
+                        burnIn=0, autocorrSkip=1, momks=(0,), DNums=(0,), n_jobs=-1):
     """
-    Generation stage: compute eigVecs, perambulator and spatial elementals for every
-    config and store them in one HDF5 file (single writer; workers only compute).
+    Generation stage: read a gauge ensemble written by experiment.saveEnsemble and
+    compute eigVecs, perambulator, spatial elementals and the topological charge for
+    every selected config, storing them in one HDF5 file (single writer; workers
+    only compute).
+
+    The LatticeParams come from the ensemble file's own attrs, so the settings can
+    never disagree with the links they describe. Configs are read one at a time as
+    they are dispatched — the ensemble is never held in memory whole.
+
+    v2 files do NOT store the gauge links: everything a measurement needs is
+    precomputed here, so the momks/DNums given must cover every operator you
+    intend to measure — there is no rebuild path afterwards. Q is stored per
+    config so theta-reweighting works without the ensemble.
+
     Reruns are incremental: existing config groups are skipped, so you can extend the
-    ensemble coverage — but NOT add datasets to existing groups (that would need the
-    stored eigVecs; use DistillWorkspace.load and its lazy elemental path instead).
+    ensemble coverage — but NOT add datasets to existing groups.
     """
-    indices = [int(i) for i in np.arange(burnIn, modelObj.metroSteps, autocorrSkip)]
+    with h5py.File(ensemblePath, "r") as ens:
+        modelSettings = LatticeParams(dimx=int(ens.attrs["dimx"]), dimt=int(ens.attrs["dimt"]),
+                                      beta=float(ens.attrs["beta"]), fMass=float(ens.attrs["fMass"]),
+                                      a=float(ens.attrs["a"]))
+        links = ens["links"]
+        indices = [int(i) for i in np.arange(burnIn, links.shape[0], autocorrSkip)]
 
-    meta = {"dimx": modelObj.dimx, "dimt": modelObj.dimt, "a": modelObj.a,
-            "fMass": modelObj.fMass, "beta": modelObj.beta,
-            "numVecs": numVecs, "version": 1}
+        meta = {"dimx": modelSettings.dimx, "dimt": modelSettings.dimt, "a": modelSettings.a,
+                "fMass": modelSettings.fMass, "beta": modelSettings.beta,
+                "numVecs": numVecs, "version": FILE_VERSION}
 
-    with h5py.File(filePath, "a") as f:
-        for key, val in meta.items():
-            if key in f.attrs:
-                if not np.all(f.attrs[key] == val):
-                    raise ValueError(f"{filePath} was generated with {key}={f.attrs[key]}, "
-                                     f"requested {key}={val}; use a different file")
-            else:
-                f.attrs[key] = val
-        if "gammat" not in f.attrs:
-            f.attrs["gammat"] = np.asarray(modelObj.gammat, dtype=complex)
-            f.attrs["gammax"] = np.asarray(modelObj.gammax, dtype=complex)
+        with h5py.File(filePath, "a") as f:
+            for key, val in meta.items():
+                if key in f.attrs:
+                    if not np.all(f.attrs[key] == val):
+                        raise ValueError(f"{filePath} was generated with {key}={f.attrs[key]}, "
+                                         f"requested {key}={val}; use a different file")
+                else:
+                    f.attrs[key] = val
+            #provenance, outside the consistency check so a moved ensemble is not an error
+            if "sourceEnsemble" not in f.attrs:
+                f.attrs["sourceEnsemble"] = str(ensemblePath)
 
-        todo = [i for i in indices if f"cfg{i:05d}" not in f]
-        if not todo:
-            return filePath
+            todo = [i for i in indices if f"cfg{i:05d}" not in f]
+            if not todo:
+                return filePath
 
-        gen = Parallel(n_jobs=n_jobs, return_as="generator")(
-            delayed(_generateConfig)(modelObj, i, numVecs, momks, DNums)
-            for i in todo)
-        for i, data in tqdm(gen, total=len(todo), desc="Generating distill data"):
-            grp = f.create_group(f"cfg{i:05d}")
-            for key, arr in data.items():
-                grp.create_dataset(key, data=arr)
+            gen = Parallel(n_jobs=n_jobs, return_as="generator")(
+                delayed(_generateConfig)(modelSettings, links[i], i, numVecs, momks, DNums)
+                for i in todo)
+            for i, data, Q in tqdm(gen, total=len(todo), desc="Generating distill data"):
+                grp = f.create_group(f"cfg{i:05d}")
+                grp.attrs["Q"] = Q
+                for key, arr in data.items():
+                    grp.create_dataset(key, data=arr)
 
     return filePath
 
@@ -264,16 +288,31 @@ def generateDistillFile(modelObj: schwingerModel, filePath, numVecs, burnIn=0, a
 def readDistillMeta(filePath):
     """
     File-level metadata and inventory of a generateDistillFile cache, so notebooks
-    never need the schwingerModel pickle. Returns a SimpleNamespace with the stored
-    attrs (dimx, dimt, a, fMass, numVecs, gammat, gammax, version) plus:
+    never need the gauge ensemble file. Returns a SimpleNamespace with the stored
+    attrs (dimx, dimt, a, fMass, beta, numVecs, version) plus:
       configIndices : sorted list of stored config indices
       elemKeys      : sorted list of stored (momk, DNum) elemental keys
+      modelSettings : LatticeParams rebuilt from the attrs
+      Q             : (nCfg,) topological charge, ordered like configIndices
+                      (None for v1 files, which predate it)
     """
     with h5py.File(filePath, "r") as f:
         meta = SimpleNamespace(**{k: f.attrs[k] for k in f.attrs})
         meta.dimx, meta.dimt = int(meta.dimx), int(meta.dimt)
         meta.numVecs = int(meta.numVecs)
+        meta.version = int(meta.version)
+        #one early file predates the beta attr, so params can be incomplete
+        if all(k in f.attrs for k in ("dimx", "dimt", "beta", "fMass", "a")):
+            meta.modelSettings = LatticeParams(dimx=meta.dimx, dimt=meta.dimt,
+                                               beta=float(meta.beta), fMass=float(meta.fMass),
+                                               a=float(meta.a))
+        else:
+            meta.modelSettings = None
         meta.configIndices = sorted(int(name[3:]) for name in f if name.startswith("cfg"))
         first = f[f"cfg{meta.configIndices[0]:05d}"]
         meta.elemKeys = sorted(_parseElemKey(k) for k in first["elem"])
+        if "Q" in first.attrs:
+            meta.Q = np.array([f[f"cfg{i:05d}"].attrs["Q"] for i in meta.configIndices])
+        else:
+            meta.Q = None
     return meta
