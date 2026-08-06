@@ -50,22 +50,22 @@ def stapleCalc(modelSettings: LatticeParams,xIndex,tIndex,directionIndex, gaugeL
     return Astaple
 
 def totalAction(modelSettings: LatticeParams, gaugeLinks):
-        # calculate all wilson loops (plaquettes)
-        Ut = gaugeLinks[:,:,0] # Time links (shape: dimx, dimt)
-        Ux = gaugeLinks[:,:,1] # Space links (shape: dimx, dimt)
-        
-        # Shift arrays to get U_t(x+1, t) and U_x(x, t+1)
-        Ut_shifted_x = np.roll(Ut, shift=-1, axis=0) 
-        Ux_shifted_t = np.roll(Ux, shift=-1, axis=1) 
-        
-        # Multiply the four sides of the plaquette
-        # U_x(x,t) * U_t(x+1,t) * U_x*(x,t+1) * U_t*(x,t)
-        plaq = Ux * Ut_shifted_x * np.conjugate(Ux_shifted_t) * np.conjugate(Ut)
-        
-        # Standard Wilson gauge action: S = beta * sum(1 - Re(U_plaq))
-        action = modelSettings.beta * np.sum(1.0 - np.real(plaq))
-        
-        return action
+    # calculate all wilson loops (plaquettes)
+    Ut = gaugeLinks[:,:,0] # Time links (shape: dimx, dimt)
+    Ux = gaugeLinks[:,:,1] # Space links (shape: dimx, dimt)
+    
+    # Shift arrays to get U_t(x+1, t) and U_x(x, t+1)
+    Ut_shifted_x = np.roll(Ut, shift=-1, axis=0) 
+    Ux_shifted_t = np.roll(Ux, shift=-1, axis=1) 
+    
+    # Multiply the four sides of the plaquette
+    # U_x(x,t) * U_t(x+1,t) * U_x*(x,t+1) * U_t*(x,t)
+    plaq = Ux * Ut_shifted_x * np.conjugate(Ux_shifted_t) * np.conjugate(Ut)
+    
+    # Standard Wilson gauge action: S = beta * sum(1 - Re(U_plaq))
+    action = modelSettings.beta * np.sum(1.0 - np.real(plaq))
+    
+    return action
 
 #calculates the derivative of the action with respect to the generalized coordiantes Q (i.e. the fields)
 #this describes how the conjugate momentum at each link will change during integration
@@ -210,7 +210,7 @@ def hmcForcingFunction_vec(settings: LatticeParams, gaugeLinks, phis, x0=None, c
 #do one step of an hmc metropolis algorithm
 #returns boolean of success of total step
 #if successful, replaces global value of gaugeLinks
-def hmcStep(modelSettings:LatticeParams, gaugeLinks, numSubSteps=100, rng=None,cgRtol=1e-5):
+def hmcStep(modelSettings:LatticeParams, gaugeLinks, numSubSteps=100, rng=None,cgRtolForce=1e-5,cgRtolAction=1e-10):
     #a shared default generator would correlate independent callers, so make a fresh one
     if rng is None:
         rng = np.random.default_rng()
@@ -231,20 +231,22 @@ def hmcStep(modelSettings:LatticeParams, gaugeLinks, numSubSteps=100, rng=None,c
     conjPInitial = rng.normal(loc=0,scale=1,size=(modelSettings.dimx,modelSettings.dimt,2))
 
     #first momentum half step:
-    Force, X = hmcForcingFunction_vec(modelSettings, gaugeLinksCopy,phi,cgRtol=cgRtol)
+    Force, X = hmcForcingFunction_vec(modelSettings, gaugeLinksCopy,phi,cgRtol=cgRtolForce)
     conjP = conjPInitial - epsilon/2 * Force
     for i in range(numSubSteps-1):
         gaugeLinksCopy *= np.exp((1j)*epsilon *conjP)
-        Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,x0=X,cgRtol=cgRtol)
+        Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,x0=X,cgRtol=cgRtolForce)
         conjP = conjP - epsilon * Force
     #last step
     gaugeLinksCopy *= np.exp((1j)*epsilon *conjP)
-    Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,x0=X,cgRtol=cgRtol)
+    Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,x0=X,cgRtol=cgRtolForce)
     conjP = conjP - epsilon/2 * Force
 
+    #force errors are metropolis-corrected, but errors here enter dH directly,
+    #so the action solves get the tighter tolerance
     metroFactor = np.exp(0.5*np.sum(conjPInitial**2)-0.5*np.sum(conjP**2)
                             +totalAction(modelSettings, gaugeLinks)-totalAction(modelSettings, gaugeLinksCopy)
-                            +pseudoBilinear(modelSettings, phi,gaugeLinks,cgRtol)-pseudoBilinear(modelSettings,phi,gaugeLinksCopy,cgRtol))
+                            +pseudoBilinear(modelSettings, phi,gaugeLinks,cgRtolAction)-pseudoBilinear(modelSettings,phi,gaugeLinksCopy,cgRtolAction))
     r=rng.random()
     if(r<metroFactor):
         success=True
@@ -282,7 +284,8 @@ def tunnelStep(modelSettings:LatticeParams, gaugeLinks,rng=None):
 
     return gaugeLinks, success
 
-def hmcChain(modelSettings:LatticeParams, metroSteps=1000, numSubSteps = 10, cgRtol=1e-5,
+def hmcChain(modelSettings:LatticeParams, metroSteps=1000, numSubSteps = 10,
+             cgRtolForce=1e-5, cgRtolAction=1e-10,
              tunneling=True, seed=0, tqdmPosition=0):
 
     rng = np.random.default_rng(seed)
@@ -297,7 +300,8 @@ def hmcChain(modelSettings:LatticeParams, metroSteps=1000, numSubSteps = 10, cgR
     for currentStep in tqdm(range(metroSteps), position=tqdmPosition, leave=True):
 
         gaugeLinks, acceptHistory[currentStep] = hmcStep(modelSettings, gaugeLinks,
-                                                          numSubSteps=numSubSteps, rng=rng,cgRtol=cgRtol)
+                                                          numSubSteps=numSubSteps, rng=rng,
+                                                          cgRtolForce=cgRtolForce,cgRtolAction=cgRtolAction)
 
         if(tunneling):
             #if doing tunneling steps, do them here

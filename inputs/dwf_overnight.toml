@@ -1,0 +1,32 @@
+#overnight DWF ensemble:  python run_sim.py inputs/dwf_overnight.toml
+#16 chains on 24 physical cores; ~1h thermalization then production
+#(burn-in measured at ~100 traj for topology at beta=2, 300 is 3x safety)
+
+outputFile = "configs/dwf_beta_3.0_m_0.1_Nx_16_Nt_16_N5_16.h5"
+
+[physics]
+beta = 3.0
+fMass = 0.1
+fermionAction = "dwf"
+dim5 = 16
+M5 = 1.0
+
+[lattice]
+dimx = 16
+dimt = 16
+
+[run]
+targetConfigs = 5000
+burnIn = 300
+nChains = 16
+nCores = 16
+randSeed = 0
+#cgRtolForce = 1e-5    (defaults)
+#cgRtolAction = 1e-10
+
+[substeps]
+#auto-tune: nss=35 was marginal in the benchmark, let the pilot find it
+targetAcceptance = 0.85
+pilotSteps = 50
+startSubSteps = 30
+maxSubSteps = 200

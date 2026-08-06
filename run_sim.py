@@ -37,13 +37,23 @@ def loadInput(path):
         'burnIn':     run['burnIn'],
         #optional
         'aSpacing': raw['physics'].get('aSpacing', 1.0),
-        'cgRtol':   run.get('cgRtol', 1e-5),
+        #the force solves are metropolis-corrected so they may run loose; the
+        #action solves enter dH directly and stay tight. Old inputs' single
+        #cgRtol is honored as the force tolerance.
+        'cgRtolForce':  run.get('cgRtolForce', run.get('cgRtol', 1e-5)),
+        'cgRtolAction': run.get('cgRtolAction', 1e-10),
         'randSeed': run.get('randSeed', 0),
         'nCores':   run.get('nCores', os.cpu_count()),
         'tunneling': run.get('tunneling', False),
+        #sea quark discretization: "wilson" (default) or "dwf" (needs dim5, M5)
+        'fermionAction': raw['physics'].get('fermionAction', 'wilson'),
+        'dim5': raw['physics'].get('dim5'),
+        'M5':   raw['physics'].get('M5'),
     }
     if cfg['metroSteps'] is None:
         raise KeyError(f"{path} sets neither run.metroSteps nor run.targetConfigs")
+    if cfg['fermionAction'] == 'dwf' and (cfg['dim5'] is None or cfg['M5'] is None):
+        raise KeyError(f"{path} sets fermionAction='dwf' but not physics.dim5 and physics.M5")
     cfg['nChains'] = run.get('nChains', cfg['nCores'])
 
     sub = raw.get('substeps', {})
@@ -63,7 +73,10 @@ def pilotAcceptance(cfg, numSubSteps):
         beta=cfg['beta'], fMass=cfg['fMass'], aSpacing=cfg['aSpacing'],
         Nx=cfg['dimx'], Nt=cfg['dimt'],
         metroSteps=cfg['pilotSteps'], numSubSteps=numSubSteps,
-        tunneling=cfg['tunneling'], cgRtol=cfg['cgRtol'], seed=cfg['randSeed'],
+        tunneling=cfg['tunneling'],
+        cgRtolForce=cfg['cgRtolForce'], cgRtolAction=cfg['cgRtolAction'],
+        fermionAction=cfg['fermionAction'], dim5=cfg['dim5'], M5=cfg['M5'],
+        seed=cfg['randSeed'],
         tqdmPosition=1,   #keep the pilot bar below the tuning report lines
     )
     return accept
@@ -127,7 +140,10 @@ def main(inputPath):
         Nx=cfg['dimx'], Nt=cfg['dimt'],
         metroSteps=cfg['metroSteps'], numSubSteps=numSubSteps,
         tunneling=cfg['tunneling'], cores=cfg['nCores'], chains=cfg['nChains'],
-        perChainBurnIn=cfg['burnIn'], cgRtol=cfg['cgRtol'], randSeed=cfg['randSeed'],
+        perChainBurnIn=cfg['burnIn'],
+        cgRtolForce=cfg['cgRtolForce'], cgRtolAction=cfg['cgRtolAction'],
+        fermionAction=cfg['fermionAction'], dim5=cfg['dim5'], M5=cfg['M5'],
+        randSeed=cfg['randSeed'],
     )
 
     print(f"saved {cfg['metroSteps']} configurations to {cfg['outputFile']}")
