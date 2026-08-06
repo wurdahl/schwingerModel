@@ -6,7 +6,7 @@ from scipy.stats import bootstrap
 from scipy.optimize import curve_fit
 from tqdm import tqdm
 
-from .params import LatticeParams
+from .params import LatticeParams, dwfParams
 
 #builds the dirac operator using the global gaugeLinks configuration
 # matrix is a square matrix with dimensional ordering (space, time, spin) 
@@ -46,6 +46,47 @@ def buildDiracOp(modelSettings: LatticeParams, gaugeLinks, chemicalPot=0):
     Dee-=1/(2*modelSettings.a) * sparse.kron(T_t_neg@(timeLinks.conj()),eyeD+modelSettings.gammat)*np.exp(-modelSettings.a*chemicalPot)
 
     return Dee
+
+def buildDomainWall5(modelSettings: dwfParams, gaugeLinks):
+    Pminus = (np.eye(2) - modelSettings.gamma5)/2
+    Pplus  = (np.eye(2) + modelSettings.gamma5)/2
+
+    N5 = modelSettings.dim5
+
+    #identity term
+    D5 = sparse.eye_array(N5*modelSettings.dimx*modelSettings.dimt*2)
+
+    #projector terms
+    shift5_pos = sparse.eye_array(N5,k=1)
+    xt_identity = sparse.eye_array(modelSettings.dimx*modelSettings.dimt)
+    D5-= sparse.kron(shift5_pos, sparse.kron(xt_identity, Pminus))
+
+    shift5_neg = sparse.eye_array(N5,k=-1)
+    D5-=sparse.kron(shift5_neg, sparse.kron(xt_identity, Pplus))
+
+    #mass terms
+    massPos = sparse.csr_array(([1.0], ([N5-1], [0])), shape=(N5, N5))   # \delta_{s,N5-1} \delta_{0,r}
+    D5+=modelSettings.fMass * sparse.kron(massPos, sparse.kron(xt_identity,Pminus))
+
+    massNeg = sparse.csr_array(([1.0], ([0], [N5-1])), shape=(N5, N5))   # \delta_{s,0} \delta_{N5-1,r}
+    D5+=modelSettings.fMass * sparse.kron(massNeg, sparse.kron(xt_identity,Pplus))
+
+    return D5
+
+
+def buildDwfOp(modelSettings: dwfParams, gaugeLinks):
+
+    wilsonSettings = LatticeParams(dimx=modelSettings.dimx,dimt=modelSettings.dimt,
+                                   beta=modelSettings.beta,fMass=-modelSettings.M5, a=modelSettings.a)
+
+    wilsonOp = buildDiracOp(wilsonSettings, gaugeLinks)
+
+    dim5Id = sparse.eye_array(modelSettings.dim5)
+
+    return sparse.kron(dim5Id, wilsonOp) + buildDomainWall5(modelSettings, gaugeLinks)
+
+
+
 
 def applyCovDerivative(modelSettings: LatticeParams, gaugeLinks, fields):
     """Symmetric covariant derivative on fields of shape (N_t, N_x, N_vec)."""
