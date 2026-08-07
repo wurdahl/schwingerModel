@@ -30,13 +30,24 @@ def tqdm_joblib(tqdm_object):
 
 from . import buildOps as ops
 from . import topology as top
-from .params import LatticeParams
-from .reweighting import getWeightingFactorsTheta
+from .params import LatticeParams, dwfParams
 
 FILE_VERSION = 2   # v2: no links, no gamma attrs, per-config Q
 
 GAMMAS = {"g5":np.array([[1j,0],[0,-1j]]),"gx":np.array([[0,1],[1,0]]),
           "gt":np.array([[0,-1j],[1j,0]]), "id":np.eye(2)}
+
+def _paramsFromAttrs(attrs):
+    """LatticeParams or dwfParams from h5 attrs, keyed on the fermionAction attr
+    (absent in files that predate it, which are all wilson)."""
+    if str(attrs.get("fermionAction", "wilson")) == "dwf":
+        return dwfParams(dimx=int(attrs["dimx"]), dimt=int(attrs["dimt"]),
+                         dim5=int(attrs["dim5"]),
+                         beta=float(attrs["beta"]), fMass=float(attrs["fMass"]),
+                         M5=float(attrs["M5"]), a=float(attrs["a"]))
+    return LatticeParams(dimx=int(attrs["dimx"]), dimt=int(attrs["dimt"]),
+                         beta=float(attrs["beta"]), fMass=float(attrs["fMass"]),
+                         a=float(attrs["a"]))
 
 def findPartialEigenBasis(modelSettings: LatticeParams, gaugeLinks, numVecs = 4):
 
@@ -47,9 +58,6 @@ def findPartialEigenBasis(modelSettings: LatticeParams, gaugeLinks, numVecs = 4)
 
         #This should find the smallest eigenvalues/eigenvectors of the laplacian
         eigs, eigVecs = sparse.linalg.eigsh(lap, k=numVecs,sigma=0, which='LM')
-
-        #momentum projection
-        # eigVecs *= np.exp(-1j*2*np.pi*momk*np.arange(modelSettings.dimx)/modelSettings.dimx)
 
         eigenBases.append(eigVecs)
 
@@ -82,6 +90,48 @@ def buildPerambulator(modelSettings: LatticeParams, gaugeLinks, eigVecs, chemica
 
         Phi = lu.solve(B).reshape(N_x, N_t, 2, N_vec, 2)
         # (x, t_sink, s_sink, k_src, s_src)
+
+        # einsum: t=t_sink, a=x (contracted), i=l_sink, j=s_sink, k=k_src, d=s_src
+        tau[:, t_src] = np.einsum('tai, atjkd -> tijkd', eigVecs.conj(), Phi, optimize=True)
+
+    return tau
+
+def buildDwfPerambulator(modelSettings: dwfParams, gaugeLinks, eigVecs):
+    """
+    Domain wall version of buildPerambulator: same tau shape and index meaning,
+    but the physical 2D propagator is the 5D inverse taken between the walls,
+      q(x)    = P_- psi(x, s=0) + P_+ psi(x, s=N5-1)
+      qbar(y) = psibar(y, N5-1) P_- + psibar(y, 0) P_+
+    With gamma5 = diag(1,-1) the projectors are diagonal in spin, so applying
+    them is just routing spin components to 5th-dim walls:
+      source: spin 0 (P+) -> wall 0        spin 1 (P-) -> wall N5-1
+      sink:   spin 0 (P+) <- wall N5-1     spin 1 (P-) <- wall 0
+    The wall-to-wall propagator differs from the effective-operator inverse by
+    a contact term only, which cannot contribute at t_sink != t_src.
+    """
+    # eigVecs shape: (dimt, dimx, numVecs)
+
+    N_t, N_x, N_vec = eigVecs.shape
+    N5 = modelSettings.dim5
+    N2 = N_x*N_t*2      # each 5th-dim slice has the full 2D (x, t, spin) layout
+
+    lu = splu(ops.buildDwfOp(modelSettings, gaugeLinks).tocsc())
+
+    tau = np.zeros((N_t, N_t, N_vec, 2, N_vec, 2), dtype=complex)
+
+    for t_src in range(N_t):
+        # Build sources: one column per (k, s), localized at t_src on the source wall
+        B = np.zeros((N5*N2, N_vec*2), dtype=complex)
+        for s in range(2):
+            rows2d = np.arange(N_x)*N_t*2 + t_src*2 + s
+            wall = 0 if s == 0 else N5-1
+            B[np.ix_(wall*N2 + rows2d, np.arange(N_vec)*2 + s)] = eigVecs[t_src]  # (N_x, N_vec)
+
+        Phi5 = lu.solve(B).reshape(N5, N_x, N_t, 2, N_vec, 2)
+        # (s5, x, t_sink, s_sink, k_src, s_src) -> extract at the sink walls
+        Phi = np.empty((N_x, N_t, 2, N_vec, 2), dtype=complex)
+        Phi[:, :, 0] = Phi5[N5-1, :, :, 0]
+        Phi[:, :, 1] = Phi5[0, :, :, 1]
 
         # einsum: t=t_sink, a=x (contracted), i=l_sink, j=s_sink, k=k_src, d=s_src
         tau[:, t_src] = np.einsum('tai, atjkd -> tijkd', eigVecs.conj(), Phi, optimize=True)
@@ -149,8 +199,13 @@ class DistillWorkspace:
     @property
     def tau(self):
         if self._tau is None:
-            self._tau = buildPerambulator(self.modelSettings, self.gaugeLinks,
-                                          self.eigVecs, chemicalPot=self.chemicalPot)
+            #the params type carries the fermion action: dwfParams -> wall propagator
+            if isinstance(self.modelSettings, dwfParams):
+                self._tau = buildDwfPerambulator(self.modelSettings, self.gaugeLinks,
+                                                 self.eigVecs)
+            else:
+                self._tau = buildPerambulator(self.modelSettings, self.gaugeLinks,
+                                              self.eigVecs, chemicalPot=self.chemicalPot)
         return self._tau
 
     def elemental(self, op: MesonOp, bar=False):
@@ -189,9 +244,7 @@ class DistillWorkspace:
                 raise KeyError(f"{filePath} has no group {gname}")
             g = f[gname]
 
-            modelSettings = LatticeParams(dimx=int(f.attrs["dimx"]), dimt=int(f.attrs["dimt"]),
-                                          beta=float(f.attrs["beta"]), fMass=float(f.attrs["fMass"]),
-                                          a=float(f.attrs["a"]))
+            modelSettings = _paramsFromAttrs(f.attrs)
 
             ws = cls.__new__(cls)
             ws.modelSettings, ws.gaugeLinks, ws.chemicalPot = modelSettings, None, 0
@@ -247,15 +300,18 @@ def generateDistillFile(ensemblePath, filePath, numVecs,
     ensemble coverage — but NOT add datasets to existing groups.
     """
     with h5py.File(ensemblePath, "r") as ens:
-        modelSettings = LatticeParams(dimx=int(ens.attrs["dimx"]), dimt=int(ens.attrs["dimt"]),
-                                      beta=float(ens.attrs["beta"]), fMass=float(ens.attrs["fMass"]),
-                                      a=float(ens.attrs["a"]))
+        #the ensemble's fermionAction attr decides which params (and perambulator) to use
+        modelSettings = _paramsFromAttrs(ens.attrs)
         links = ens["links"]
         indices = [int(i) for i in np.arange(burnIn, links.shape[0], autocorrSkip)]
 
         meta = {"dimx": modelSettings.dimx, "dimt": modelSettings.dimt, "a": modelSettings.a,
                 "fMass": modelSettings.fMass, "beta": modelSettings.beta,
-                "numVecs": numVecs, "version": FILE_VERSION}
+                "numVecs": numVecs, "version": FILE_VERSION,
+                "fermionAction": "dwf" if isinstance(modelSettings, dwfParams) else "wilson"}
+        if isinstance(modelSettings, dwfParams):
+            meta["dim5"] = modelSettings.dim5
+            meta["M5"] = modelSettings.M5
 
         with h5py.File(filePath, "a") as f:
             for key, val in meta.items():
@@ -303,9 +359,7 @@ def readDistillMeta(filePath):
         meta.version = int(meta.version)
         #one early file predates the beta attr, so params can be incomplete
         if all(k in f.attrs for k in ("dimx", "dimt", "beta", "fMass", "a")):
-            meta.modelSettings = LatticeParams(dimx=meta.dimx, dimt=meta.dimt,
-                                               beta=float(meta.beta), fMass=float(meta.fMass),
-                                               a=float(meta.a))
+            meta.modelSettings = _paramsFromAttrs(f.attrs)
         else:
             meta.modelSettings = None
         meta.configIndices = sorted(int(name[3:]) for name in f if name.startswith("cfg"))

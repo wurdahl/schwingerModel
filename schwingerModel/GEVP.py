@@ -438,14 +438,95 @@ def _fitLogLinear(curve, fitT):
     return -slope, intercept
 
 
-def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False, labelIdx=1):
+def _backwardFactor(E, ts, ti, dimt, shift, sign):
+    """The periodic image's contribution relative to the forward exponential.
+
+    A single state on a periodic lattice contributes both e^{-E tau} and its
+    around-the-torus image, so writing the curve as (forward) x (this factor)
+    keeps E and logA meaning the same thing for every fit form:
+
+        exp:  1
+        cosh: 1 + e^{-E(T - 2 tau)}          symmetric, sign = +1
+        sinh: 1 - e^{-E(T - 2 tau - shift)}  antisymmetric, sign = -1
+
+    The sinh case is what a shift produces: C(tau+s) - C(tau) of a cosh is a
+    sinh centred at (T - s)/2, so the factor passes through zero there and the
+    curve changes sign.
+
+    Args:
+        E: Energy.
+        ts: (k,) curve-index times.
+        ti: GEVP reference slice, so actual time is tau = t + ti.
+        dimt: Full temporal extent T.
+        shift: The shift used to build the curve.
+        sign: +1 for cosh, -1 for sinh, 0 for a pure forward exponential.
+
+    Returns:
+        np.ndarray: The factor at each time, with |.| applied so the log-space
+        fit survives past a sinh's zero crossing.
+    """
+    if sign == 0:
+        return np.ones_like(np.asarray(ts, dtype=float))
+    tau = np.asarray(ts, dtype=float) + ti
+    return np.abs(1.0 + sign * np.exp(-E * (dimt - 2.0 * tau - shift)))
+
+
+_FIT_SIGNS = {"exp": 0, "cosh": 1, "sinh": -1}
+
+
+def _fitPeriodic(curve, fitT, ti, dimt, shift, sign):
+    """Two-parameter fit of one eigenvalue curve including its periodic image.
+
+    Same (E, logA) parameterisation as _fitLogLinear — the model is
+    exp(logA - E t) * _backwardFactor(...) — so the extra term costs no extra
+    parameter. Fitted in log space, like the exponential case, and seeded from
+    the log-linear fit.
+
+    Args:
+        curve: (T',) eigenvalue curve.
+        fitT: (lo, hi) window in curve-index units; fits on [lo, hi).
+        ti: GEVP reference slice.
+        dimt: Full temporal extent T.
+        shift: The shift used to build the curve.
+        sign: +1 cosh, -1 sinh.
+
+    Returns:
+        tuple[float, float]: (energy, logA); (nan, nan) if the window has no
+        usable positive signal or the fit fails.
+    """
+    y = curve[fitT[0]:fitT[1]]
+    if len(y) < 2 or np.any(y <= 0) or not np.all(np.isfinite(y)):
+        return np.nan, np.nan
+    E0, logA0 = _fitLogLinear(curve, fitT)          # exponential seed
+    if not np.isfinite(E0):
+        return np.nan, np.nan
+    ts = np.arange(fitT[0], fitT[1])
+
+    def logModel(t, E, logA):
+        with np.errstate(divide="ignore"):
+            return logA - E * t + np.log(_backwardFactor(E, t, ti, dimt, shift, sign))
+
+    # E >= 0: the periodic forms are exactly degenerate under E -> -E (the
+    # curve is symmetric/antisymmetric about its centre), so a window reaching
+    # past the centre can otherwise converge to the mirror solution. Same bound
+    # gevpMassExtract uses. The seed can be negative there (log-linear slope of
+    # a rising curve), so clip it into the feasible region.
+    try:
+        p, _ = curve_fit(logModel, ts, np.log(y), p0=[max(E0, 1e-6), logA0],
+                         bounds=([0, -np.inf], [np.inf, np.inf]), maxfev=20000)
+    except Exception:
+        return np.nan, np.nan
+    return p[0], p[1]
+
+
+def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False, labelIdx=1, fitForm="exp"):
     """Reduce factory for bootstrapEnsemble that goes all the way to masses.
 
-    Anchored GEVP (optionally shifted), then a two-parameter log-linear fit per
-    state. Because the fit is redone on every resample, the bootstrap
-    distribution of the mass exactly marginalizes the amplitude (and inherits
-    all data correlations). Via bootstrapEnsemble the mass covariance is useful
-    for splittings like E_pipi - 2 E_pi.
+    Anchored GEVP (optionally shifted), then a two-parameter fit per state.
+    Because the fit is redone on every resample, the bootstrap distribution of
+    the mass exactly marginalizes the amplitude (and inherits all data
+    correlations). Via bootstrapEnsemble the mass covariance is useful for
+    splittings like E_pipi - 2 E_pi.
 
     Args:
         ti: GEVP reference slice. Defaults to 1.
@@ -457,23 +538,49 @@ def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False, labelIdx=1):
         withAmp: If False, the reduce returns (n_states,) masses and
             bootstrapEnsemble's cov is the (n, n) mass covariance. If True, it
             returns (n_states, 2) with columns [E, logA] — the fitted curve is
-            exp(logA - E * t) in the (shifted) curve's time units — and cov
-            becomes (2, n, n): [0] mass cov, [1] logA cov. Defaults to False.
+            exp(logA - E * t) times the periodic factor for this fitForm, in the
+            (shifted) curve's time units — and cov becomes (2, n, n): [0] mass
+            cov, [1] logA cov. Defaults to False.
         labelIdx: Anchor curve index for state labeling; see gevp. Defaults to 1.
+        fitForm: Which single-state shape to fit, all two-parameter:
+            "exp"  forward exponential only. Correct just where the periodic
+                   image is negligible, so it needs an early, short window.
+            "cosh" symmetric periodic form, for shift = 0 with operators whose
+                   correlator is symmetric about T/2.
+            "sinh" antisymmetric form centred at (T - shift)/2, which is what a
+                   shift > 0 produces from a cosh.
+            "auto" "sinh" when shift > 0, else "cosh".
+            The periodic forms cost no extra parameter and let the window run to
+            much larger t, which matters most on short lattices. Defaults to
+            "exp", preserving the previous behaviour.
 
     Returns:
         Callable[[np.ndarray], np.ndarray]: Reduce mapping a (n, n, T) mean
         matrix to (n_states,) masses (or (n_states, 2) with withAmp);
         failed fits yield NaN for that state only.
+
+    Raises:
+        ValueError: If fitForm is not one of the names above.
     """
+    if fitForm == "auto":
+        fitForm = "sinh" if shift else "cosh"
+    if fitForm not in _FIT_SIGNS:
+        raise ValueError(f"fitForm {fitForm!r} not in {sorted(_FIT_SIGNS)} or 'auto'")
+    sign = _FIT_SIGNS[fitForm]
+
     gr = makeGevpReduce(ti=ti, shift=shift, labelIdx=labelIdx)
     perState = isinstance(fitT[0], (tuple, list))
 
     def _reduce(Cmean, withAmp=withAmp):
+        dimt = Cmean.shape[2]                       # full extent, before shifting
         curves = gr(Cmean)
         windows = fitT if perState else [fitT] * curves.shape[1]
-        fits = np.array([_fitLogLinear(curves[:, e], w)
-                         for e, w in enumerate(windows)])   # (n, 2)
+        if sign == 0:
+            fits = np.array([_fitLogLinear(curves[:, e], w)
+                             for e, w in enumerate(windows)])   # (n, 2)
+        else:
+            fits = np.array([_fitPeriodic(curves[:, e], w, ti, dimt, shift, sign)
+                             for e, w in enumerate(windows)])   # (n, 2)
         return fits if withAmp else fits[:, 0]
 
     return _reduce

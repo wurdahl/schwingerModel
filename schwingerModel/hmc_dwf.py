@@ -1,6 +1,5 @@
 import numpy as np
 from scipy.sparse.linalg import cg
-from scipy.sparse.linalg import splu,spsolve
 
 from tqdm import tqdm
 
@@ -47,10 +46,10 @@ def fermionForceBilinear(settings: dwfParams, gaugeLinks, left, right):
     out = np.zeros((settings.dimx, settings.dimt, 2))
 
     # Spatial: Z_x = -c*Ux * <L|P-_x|R_{x+1}> + c*Ux* * <L_{x+1}|P+_x|R>
-    Pm_x_R_xp1 = np.einsum('ij,sxyj->sxyi', P_minus_x, R_xp1)
-    Pp_x_R     = np.einsum('ij,sxyj->sxyi', P_plus_x,  right)
-    Z_x = (-c * Ux      * np.einsum('sxyi,sxyi->xy', np.conj(left),  Pm_x_R_xp1)
-            + c * np.conj(Ux) * np.einsum('sxyi,sxyi->xy', np.conj(L_xp1), Pp_x_R))
+    Pm_x_R_xp1 = np.einsum('ij,sxyj->sxyi', P_minus_x, R_xp1,optimize=True)
+    Pp_x_R     = np.einsum('ij,sxyj->sxyi', P_plus_x,  right,optimize=True)
+    Z_x = (-c * Ux      * np.einsum('sxyi,sxyi->xy', np.conj(left),  Pm_x_R_xp1,optimize=True)
+            + c * np.conj(Ux) * np.einsum('sxyi,sxyi->xy', np.conj(L_xp1), Pp_x_R,optimize=True))
     out[:, :, 1] = 2 * Z_x.real
 
     # Time: Z_t = -c*Ut * <L|P-_t|R_{t+1}> + c*Ut* * <L_{t+1}|P+_t|R>
@@ -163,8 +162,15 @@ def hmcStep(modelSettings:dwfParams, gaugeLinks, numSubSteps=100, rng=None,cgRto
             +1j*rng.normal(loc=0,scale=1/np.sqrt(2),size=(modelSettings.dim5*modelSettings.dimx*modelSettings.dimt*2)))
 
     pvSettings = modelSettings._replace(fMass=1)
-    D_pv = buildDwfOp(pvSettings,gaugeLinks).tocsc()
-    chi_pv = spsolve(D_pv, eta)
+    #PV heat-bath chi = D^{-1} eta via D^dag (D D^dag)^{-1} eta: the fMass=1
+    #operator is well-conditioned, so CG beats a direct sparse LU by ~100x.
+    #Tight rtol because heat-bath error is not corrected by the Metropolis step.
+    D_pv = buildDwfOp(pvSettings, gaugeLinks)
+    D_pv_dag = D_pv.conj().T
+    y, exitcode = cg(D_pv @ D_pv_dag, eta, rtol=1e-12)
+    if exitcode != 0:
+        raise RuntimeError(f"PV heat-bath CG failed to converge! Exit code: {exitcode}")
+    chi_pv = D_pv_dag @ y
 
     #generate initial value for conjugate field
     conjPInitial = rng.normal(loc=0,scale=1,size=(modelSettings.dimx,modelSettings.dimt,2))

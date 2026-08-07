@@ -14,6 +14,10 @@ import logging
 import numpy as np
 import matplotlib.pyplot as plt
 
+# imported rather than reimplemented: the overlaid curve must be the SAME model
+# massReduce fitted, or the plot quietly misrepresents the fit
+from .GEVP import _backwardFactor, _FIT_SIGNS
+
 
 # ---------------------------------------------------------------------------
 # Style
@@ -216,12 +220,53 @@ def _window(spec, state):
     return tuple(spec[state]) if _isSeq(spec[0]) else tuple(spec)
 
 
+def fitCurve(form="exp", ti=1, shift=0, dimt=None):
+    """Rebuild massReduce's fitted model as f(t, E, logA), for overlaying.
+
+    Pass the SAME form/ti/shift you gave massReduce. With the default "exp" this
+    is just exp(logA - E t); the periodic forms multiply in the around-the-torus
+    image, so the drawn curve turns over where the data does instead of running
+    off the bottom of the plot.
+
+    Args:
+        form: "exp", "cosh", "sinh", or "auto" ("sinh" if shift else "cosh").
+        ti: GEVP reference slice, so actual time is tau = t + ti. Defaults to 1.
+        shift: The shift used to build the curves. Defaults to 0.
+        dimt: Full temporal extent T. Required for the periodic forms.
+
+    Returns:
+        Callable[[array, float, float], array]: f(t, E, logA), carrying a
+        `.periodic` flag the plot functions use to decide how far to draw it.
+
+    Raises:
+        ValueError: On an unknown form, or a periodic form without dimt.
+    """
+    if form == "auto":
+        form = "sinh" if shift else "cosh"
+    if form not in _FIT_SIGNS:
+        raise ValueError(f"form {form!r} not in {sorted(_FIT_SIGNS)} or 'auto'")
+    sign = _FIT_SIGNS[form]
+    if sign != 0 and dimt is None:
+        raise ValueError(f"dimt is required for the {form!r} form")
+
+    def _model(t, E, logA):
+        t = np.asarray(t, dtype=float)
+        return np.exp(logA - E * t) * _backwardFactor(E, t, ti, dimt, shift, sign)
+
+    _model.periodic = sign != 0
+    return _model
+
+
+_EXP_MODEL = fitCurve("exp")
+
+
 # ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
 
 def prinCorrelSemilog(prinCorrels, masses=None, labels=None, states=None,
-                      fitT=None, tmax=None, absolute=True, maxCols=4, title=None,
+                      fitT=None, tmax=None, absolute=True, fitModel=None,
+                      maxCols=4, title=None,
                       xlabel=r"$(t - t_i)/a$",
                       ylabel=None, ylim=None, savePath=None):
     """Raw GEVP eigenvalue curves on a log axis, one panel per ensemble.
@@ -262,6 +307,11 @@ def prinCorrelSemilog(prinCorrels, masses=None, labels=None, states=None,
             positive point since a log axis cannot draw the rest.
         absolute: Plot |lambda| rather than lambda. Defaults to True. Set False
             to drop negative points entirely and see only the decaying side.
+        fitModel: f(t, E, logA) rebuilding the model massReduce fitted; build it
+            with fitCurve(form, ti, shift, dimt) using the SAME arguments. The
+            default assumes a plain forward exponential, so pass this whenever
+            massReduce ran with fitForm="cosh"/"sinh" — otherwise the overlaid
+            line is not the curve that was fitted.
         maxCols: Maximum panels per row. Defaults to 4.
         title: Figure suptitle. Defaults to None.
         xlabel: Time-axis label, on the bottom panel of each column.
@@ -276,9 +326,15 @@ def prinCorrelSemilog(prinCorrels, masses=None, labels=None, states=None,
     Raises:
         ValueError: If masses is given and differs in length from prinCorrels.
     """
-    if masses is not None and len(masses) != len(prinCorrels):
-        raise ValueError(f"prinCorrels has {len(prinCorrels)} entries but masses "
-                         f"has {len(masses)}; they must be aligned")
+    if masses is not None:
+        if len(masses) != len(prinCorrels):
+            raise ValueError(f"prinCorrels has {len(prinCorrels)} entries but masses "
+                             f"has {len(masses)}; they must be aligned")
+        for i, m in enumerate(masses):
+            if np.ndim(m[0]) != 2 or np.shape(m[0])[1] != 2:
+                raise ValueError(f"masses[{i}] central has shape {np.shape(m[0])}; "
+                                 "expected (n_states, 2) — rerun with "
+                                 "massReduce(..., withAmp=True)")
 
     n = len(prinCorrels)
     fig, axes, nRows, nCols = makeGrid(n, maxCols=maxCols)
@@ -345,13 +401,15 @@ def prinCorrelSemilog(prinCorrels, masses=None, labels=None, states=None,
             if masses is not None:
                 E, logA = masses[i][0][s]
                 if np.isfinite(E) and np.isfinite(logA):
-                    # only over the pre-crossing region: the forward exponential
-                    # applies there, and continuing it would drag the log range
-                    # down by decades
-                    fitSel = (raw > 0) & ~np.maximum.accumulate(neg)
-                    tf = t[sel][fitSel] if fitSel.any() else t[sel]
-                    ax.plot(tf, np.exp(logA - E * tf),
-                            color=color, lw=LW, zorder=2)
+                    model = fitModel if fitModel is not None else _EXP_MODEL
+                    if getattr(model, "periodic", False):
+                        tf = t[sel]         # turns over on its own; draw it all
+                    else:
+                        # a bare forward exponential only applies pre-crossing;
+                        # continuing it would drag the log range down by decades
+                        fitSel = (raw > 0) & ~np.maximum.accumulate(neg)
+                        tf = t[sel][fitSel] if fitSel.any() else t[sel]
+                    ax.plot(tf, model(tf, E, logA), color=color, lw=LW, zorder=2)
 
         ax.set_yscale("log")
         # scale to the DATA; late-time bars span decades and would set the range
@@ -386,12 +444,12 @@ def prinCorrelSemilog(prinCorrels, masses=None, labels=None, states=None,
 
 
 def prinCorrelOverFit(prinCorrels, masses, labels=None, state=0, fitT=None,
-                      tmax=None, maxCols=4, color=JLab_blue, marker="o",
-                      title=None, xlabel=r"$(t - t_i)/a$", ylabel=None,
-                      savePath=None):
-    """Principal correlators divided by their fitted exponential, one panel each.
+                      tmax=None, fitModel=None, maxCols=4, color=JLab_blue,
+                      marker="o", title=None, xlabel=r"$(t - t_i)/a$",
+                      ylabel=None, savePath=None):
+    """Principal correlators divided by their fitted model, one panel each.
 
-    Plots lambda^(s)(t) / (A exp(-E t)), which flattens to 1 wherever the fit
+    Plots lambda^(s)(t) / fit(t), which flattens to 1 wherever the fit
     describes the data — the deviation from unity is far easier to read than a
     log-scale correlator, and the panels stay comparable across ensembles even
     when their masses differ by an order of magnitude.
@@ -416,6 +474,11 @@ def prinCorrelOverFit(prinCorrels, masses, labels=None, state=0, fitT=None,
             Defaults to None (no shading, y-range from all plotted points).
         tmax: Plot only t < tmax, to cut the late-time noise tail. Defaults to
             None (whole curve).
+        fitModel: f(t, E, logA) rebuilding the model massReduce fitted; build it
+            with fitCurve(form, ti, shift, dimt) using the SAME arguments. The
+            default divides by a plain forward exponential, so pass this
+            whenever massReduce ran with fitForm="cosh"/"sinh" — otherwise the
+            ratio bakes the periodic image into the deviation from 1.
         maxCols: Maximum panels per row. Defaults to 4.
         color: Marker/errorbar color. Defaults to JLab_blue.
         marker: Marker shape. Defaults to "o".
@@ -465,7 +528,12 @@ def prinCorrelOverFit(prinCorrels, masses, labels=None, state=0, fitT=None,
             ax.axvspan(win[0], win[1] - 1, color=BAND, zorder=0)   # fit window
 
         if np.isfinite(E) and np.isfinite(logA):
-            fit = np.exp(logA - E * t)
+            model = fitModel if fitModel is not None else _EXP_MODEL
+            fit = model(t, E, logA)
+            # a sinh model passes through zero at its crossing; the ratio is
+            # meaningless within noise of that point, so blank it rather than
+            # letting one near-zero division set the panel's scale
+            fit[np.abs(fit) < 1e-12] = np.nan
             ratio = (central[:, state] / fit)[sel]
             # err rows are [high-central, central-low]; matplotlib wants
             # [lower, upper]. A negative entry means the central value fell
@@ -499,8 +567,11 @@ def prinCorrelOverFit(prinCorrels, masses, labels=None, state=0, fitT=None,
         if i + nCols >= n:                  # nothing below it — label the x axis
             ax.set_xlabel(xlabel)
         if i % nCols == 0:                  # leftmost of its row
-            ax.set_ylabel(ylabel if ylabel is not None else
-                          rf"$\lambda^{{({state})}}(t) \, / \, A\,e^{{-E_{state} t}}$")
+            # the exponential-specific label would misdescribe a periodic fit
+            defaultY = (rf"$\lambda^{{({state})}}(t) \, / \, \mathrm{{fit}}$"
+                        if fitModel is not None and getattr(fitModel, "periodic", False)
+                        else rf"$\lambda^{{({state})}}(t) \, / \, A\,e^{{-E_{state} t}}$")
+            ax.set_ylabel(ylabel if ylabel is not None else defaultY)
 
     if title is not None:
         fig.suptitle(title, fontsize=18)

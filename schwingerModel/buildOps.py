@@ -86,8 +86,6 @@ def buildDwfOp(modelSettings: dwfParams, gaugeLinks):
     return sparse.kron(dim5Id, wilsonOp) + buildDomainWall5(modelSettings, gaugeLinks)
 
 
-
-
 def applyCovDerivative(modelSettings: LatticeParams, gaugeLinks, fields):
     """Symmetric covariant derivative on fields of shape (N_t, N_x, N_vec)."""
     U  = gaugeLinks[:, :, 1].T[:, :, None]                    # (N_t, N_x, 1)

@@ -10,6 +10,5 @@ from . import topology
 from . import params
 from . import hmc
 from . import hmc_dwf
-from . import hmc_gpu
 from . import experiment
 from . import plotting
