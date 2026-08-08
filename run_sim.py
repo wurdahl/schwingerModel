@@ -45,6 +45,8 @@ def loadInput(path):
         'randSeed': run.get('randSeed', 0),
         'nCores':   run.get('nCores', os.cpu_count()),
         'tunneling': run.get('tunneling', False),
+        #where the chains run: "cpu" (joblib workers, default) or "gpu" (vmapped jax)
+        'backend': run.get('backend', 'cpu'),
         #sea quark discretization: "wilson" (default) or "dwf" (needs dim5, M5)
         'fermionAction': raw['physics'].get('fermionAction', 'wilson'),
         'dim5': raw['physics'].get('dim5'),
@@ -54,6 +56,12 @@ def loadInput(path):
         raise KeyError(f"{path} sets neither run.metroSteps nor run.targetConfigs")
     if cfg['fermionAction'] == 'dwf' and (cfg['dim5'] is None or cfg['M5'] is None):
         raise KeyError(f"{path} sets fermionAction='dwf' but not physics.dim5 and physics.M5")
+    if cfg['backend'] not in ('cpu', 'gpu'):
+        raise KeyError(f"{path} sets run.backend={cfg['backend']!r}; expected 'cpu' or 'gpu'")
+    if cfg['backend'] == 'gpu' and cfg['fermionAction'] != 'dwf':
+        raise KeyError(f"{path} sets run.backend='gpu', which only implements fermionAction='dwf'")
+    if cfg['backend'] == 'gpu' and cfg['tunneling']:
+        raise KeyError(f"{path} sets run.backend='gpu', which does not implement tunneling")
     cfg['nChains'] = run.get('nChains', cfg['nCores'])
 
     sub = raw.get('substeps', {})
@@ -66,10 +74,20 @@ def loadInput(path):
     return cfg
 
 
+def getRunner(backend):
+    """The module the run routes through. The gpu module is imported lazily because
+    importing jax initializes the gpu (and preallocates most of its memory), which
+    a cpu run must never do."""
+    if backend == 'gpu':
+        from schwingerModel import experiment_gpu
+        return experiment_gpu
+    return experiment
+
+
 def pilotAcceptance(cfg, numSubSteps):
     """Acceptance rate of a short pilot chain, measured on its second half
     so the cold-start transient does not bias the estimate."""
-    accept, _ = experiment.acceptanceFractions(
+    accept, _ = getRunner(cfg['backend']).acceptanceFractions(
         beta=cfg['beta'], fMass=cfg['fMass'], aSpacing=cfg['aSpacing'],
         Nx=cfg['dimx'], Nt=cfg['dimt'],
         metroSteps=cfg['pilotSteps'], numSubSteps=numSubSteps,
@@ -132,9 +150,10 @@ def main(inputPath):
         print(f"using {numSubSteps} substeps")
 
     stepsPerChain = -(-cfg['metroSteps'] // cfg['nChains'])   # ceil division
-    print(f"running {cfg['nChains']} chains x ({cfg['burnIn']} burn-in + {stepsPerChain} configs)")
+    print(f"running {cfg['nChains']} chains x ({cfg['burnIn']} burn-in + {stepsPerChain} configs)"
+          f" on the {cfg['backend']}")
 
-    experiment.runExperiment(
+    getRunner(cfg['backend']).runExperiment(
         cfg['outputFile'],
         beta=cfg['beta'], fMass=cfg['fMass'], aSpacing=cfg['aSpacing'],
         Nx=cfg['dimx'], Nt=cfg['dimt'],

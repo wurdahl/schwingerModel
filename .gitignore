@@ -3,3 +3,6 @@ distillCache
 *.hdf5
 *.pyc
 configs
+*.h5
+*.so
+logs

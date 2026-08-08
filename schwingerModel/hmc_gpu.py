@@ -1,14 +1,69 @@
 from functools import partial
+import os
+
+#CUDA graphs (XLA command buffers): the small-lattice HMC is kernel-launch-latency
+#bound, so recording launch sequences as graphs and replaying them cuts per-kernel
+#overhead. WHILE lets the CG loops themselves be captured; min_graph_size=2 captures
+#even short sequences. Must be set before jax initializes; setdefault means an
+#XLA_FLAGS already present in the environment wins untouched (also the escape hatch:
+#XLA_FLAGS="" disables this).
+os.environ.setdefault(
+    'XLA_FLAGS',
+    '--xla_gpu_enable_command_buffer=FUSION,CUBLAS,CUBLASLT,CUDNN,CUSTOM_CALL,CONDITIONAL,WHILE'
+    ' --xla_gpu_graph_min_graph_size=2')
 
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-from jax.scipy.sparse.linalg import cg
+def cg(A, b, x0=None, tol=1e-5, maxiter=None):
+    """Conjugate gradient for Hermitian positive-definite matvecs.
+
+    Same algorithm and stopping rule as jax.scipy.sparse.linalg.cg, without its
+    custom_linear_solve autodiff wrapper — that wrapper requires a transpose rule
+    for every op in the matvec, which the CUDA FFI operator kernel does not have
+    (and none of our solves are ever differentiated through). Returns (x, None)
+    to keep the (x, info) call shape.
+    """
+    if maxiter is None:
+        maxiter = 10 * b.size
+    x0 = jnp.zeros_like(b) if x0 is None else x0
+    #stop when |r|^2 <= (tol*|b|)^2, matching the jax/scipy default criterion
+    atol2 = tol * tol * jnp.vdot(b, b).real
+
+    r0 = b - A(x0)
+    rs0 = jnp.vdot(r0, r0).real
+
+    def cond(state):
+        _, _, _, rs, k = state
+        return (rs > atol2) & (k < maxiter)
+
+    def body(state):
+        x, r, p, rs, k = state
+        Ap = A(p)
+        alpha = rs / jnp.vdot(p, Ap).real   #real for Hermitian positive-definite A
+        x = x + alpha * p
+        r = r - alpha * Ap
+        rsNew = jnp.vdot(r, r).real
+        p = r + (rsNew / rs) * p
+        return x, r, p, rsNew, k + 1
+
+    x, _, _, _, _ = jax.lax.while_loop(cond, body, (x0, r0, r0, rs0, 0))
+    return x, None
 
 import numpy as np
 from tqdm import tqdm
 
 from .params import dwfParams
+
+#fused CUDA operator kernel (cuda/dwfApplyD.cu, built by cuda/build.sh): one
+#kernel launch per apply instead of ~25. Optional: falls back to the XLA roll
+#implementation when the library isn't built. SCHWINGER_NO_CUDA_KERNEL=1
+#disables it for A/B comparisons.
+try:
+    from . import dwf_cuda as _dwf_cuda
+    _USE_CUDA_KERNEL = _dwf_cuda.available() and os.environ.get("SCHWINGER_NO_CUDA_KERNEL") != "1"
+except Exception:
+    _USE_CUDA_KERNEL = False
 
 #spin matrices as jax constants (same convention as params.py)
 _GAMMA_X = jnp.array([[0, 1], [1, 0]], dtype=jnp.complex128)
@@ -37,16 +92,19 @@ def fermionForceBilinear(settings: dwfParams, gaugeLinks, left, right):
     (and the same for any fMass, so the Pauli-Villars force can reuse this).
     left, right: shape (dim5, dimx, dimt, 2). Returns real (dimx, dimt, 2).
     """
-    I = jnp.eye(2, dtype=jnp.complex128)
+    #constants follow the field dtype so the c64 force path stays c64
+    dataType = right.dtype
+    realType = jnp.zeros((), dataType).real.dtype
+    I = jnp.eye(2, dtype=dataType)
     c = 1j / (2 * settings.a)
 
     Ux = gaugeLinks[:, :, 1]  # (dimx, dimt)
     Ut = gaugeLinks[:, :, 0]  # (dimx, dimt)
 
-    P_minus_x = I - _GAMMA_X
-    P_plus_x  = I + _GAMMA_X
-    P_minus_t = I - _GAMMA_T
-    P_plus_t  = I + _GAMMA_T
+    P_minus_x = I - _GAMMA_X.astype(dataType)
+    P_plus_x  = I + _GAMMA_X.astype(dataType)
+    P_minus_t = I - _GAMMA_T.astype(dataType)
+    P_plus_t  = I + _GAMMA_T.astype(dataType)
 
     #axis 0 is s5, axis 1 is x, axis 2 is t
     R_xp1 = jnp.roll(right, shift=-1, axis=1)  # right[s, x+1, t, :]
@@ -69,7 +127,7 @@ def fermionForceBilinear(settings: dwfParams, gaugeLinks, left, right):
             + c * jnp.conj(Ut) * jnp.einsum('sxyi,sxyi->xy', jnp.conj(L_tp1), Pp_t_R))
 
     # Anti-periodic boundary condition: flip sign at t = dimt-1
-    bc_t = jnp.ones((settings.dimx, settings.dimt)).at[:, -1].set(-1.0)
+    bc_t = jnp.ones((settings.dimx, settings.dimt), dtype=realType).at[:, -1].set(-1.0)
     
     return jnp.stack([2 * Z_t.real * bc_t,    # time links  -> out[:, :, 0]
                       2 * Z_x.real], axis=-1) # space links -> out[:, :, 1]
@@ -90,10 +148,13 @@ def pvForce(settings: dwfParams, gaugeLinks, chi):
 @partial(jax.jit, static_argnums=0)
 def hmcForcingFunction_vec(settings: dwfParams, gaugeLinks, phis, chi, x0=None, cgRtol=1e-5):
 
+    gaugeLinks = gaugeLinks.astype(jnp.complex64)
+    phis = phis.astype(jnp.complex64)
+    chi = chi.astype(jnp.complex64)
+
     operator = lambda v: applyD_dwf(settings, gaugeLinks, applyDdag_dwf(settings, gaugeLinks, v))
     
     X, _ = cg(operator, phis, tol=cgRtol,x0=x0)
-    relRes = jnp.linalg.norm(operator(X) - phis) / jnp.linalg.norm(phis)
 
     #Y = D^\dagger X
     Y = applyDdag_dwf(settings, gaugeLinks, X)
@@ -130,7 +191,7 @@ def hmcForcingFunction_vec(settings: dwfParams, gaugeLinks, phis, chi, x0=None, 
     Force -= fermionForceBilinear(settings, gaugeLinks, X, Y)
     Force += pvForce(settings, gaugeLinks, chi)
 
-    return Force, X
+    return Force.astype(jnp.float64), X
 
 @partial(jax.jit, static_argnums=0)
 def pvAction(modelSettings: dwfParams, chi_pv, gaugeLinks):
@@ -160,6 +221,7 @@ def totalAction(modelSettings: dwfParams, gaugeLinks):
     
     return action
 
+@partial(jax.jit, static_argnums=(0, 3))
 def hmcStep(settings:dwfParams, gaugeLinks, rngKey,  numSubSteps=100, cgRtolForce=1e-5,cgRtolAction=1e-10):
     kChi, kEta, kMom, kMetro = jax.random.split(rngKey, 4)
 
@@ -181,16 +243,25 @@ def hmcStep(settings:dwfParams, gaugeLinks, rngKey,  numSubSteps=100, cgRtolForc
     pvSettings = settings._replace(fMass=1.0)
     DDdag_pv = lambda v: applyD_dwf(pvSettings, gaugeLinks, applyDdag_dwf(pvSettings, gaugeLinks, v))
     y, _ = cg(DDdag_pv, eta, tol=cgRtolAction)
-    chi_pv = applyDdag_dwf(pvSettings, gaugeLinks, y)
+    resPV = jnp.linalg.norm(DDdag_pv(y) - eta) / jnp.linalg.norm(eta)
 
+    chi_pv = applyDdag_dwf(pvSettings, gaugeLinks, y)
 
     #first momentum half step:
     Force, X = hmcForcingFunction_vec(settings, gaugeLinksCopy,phi,chi_pv,cgRtol=cgRtolForce)
     conjP = conjPInitial - epsilon/2 * Force
-    for i in range(numSubSteps-1):
-        gaugeLinksCopy *= jnp.exp(1j*epsilon *conjP)
-        Force, X = hmcForcingFunction_vec(settings,gaugeLinksCopy,phi,chi_pv,x0=X,cgRtol=cgRtolForce)
-        conjP = conjP - epsilon * Force
+
+    #full leapfrog steps as one compiled loop: carry = (links, momentum, CG warm start)
+    def leapfrogBody(carry, _):
+        U, P, Xprev = carry
+        U = U * jnp.exp(1j*epsilon*P)
+        F, Xnew = hmcForcingFunction_vec(settings, U, phi, chi_pv, x0=Xprev, cgRtol=cgRtolForce)
+        return (U, P - epsilon*F, Xnew), None
+
+    (gaugeLinksCopy, conjP, X), _ = jax.lax.scan(leapfrogBody,
+                                                 (gaugeLinksCopy, conjP, X),
+                                                 None, length=numSubSteps-1)
+
     #last step
     gaugeLinksCopy *= jnp.exp(1j*epsilon *conjP)
     Force, X = hmcForcingFunction_vec(settings,gaugeLinksCopy,phi,chi_pv, x0=X,cgRtol=cgRtolForce)
@@ -199,27 +270,22 @@ def hmcStep(settings:dwfParams, gaugeLinks, rngKey,  numSubSteps=100, cgRtolForc
     initialFermionAction, resInitial = pseudoBilinear(settings, phi,gaugeLinks,cgRtolAction)
     finalFermionAction, resFinal = pseudoBilinear(settings, phi,gaugeLinksCopy,cgRtolAction)
 
-    #the action solves enter dH directly, so an unconverged solve biases the
-    #accept/reject silently (jax cg reports nothing at maxiter): fail loudly.
-    #10x slack because jax's stopping criterion can land right at the boundary.
-    worstRes = float(jnp.maximum(resInitial, resFinal))
-    if worstRes > 10*cgRtolAction:
-        raise RuntimeError(f"Action CG failed to converge! Relative residual: {worstRes:.3e}")
-
     metroFactor = jnp.exp(0.5*jnp.sum(conjPInitial**2)-0.5*jnp.sum(conjP**2)
                             +totalAction(settings, gaugeLinks)-totalAction(settings, gaugeLinksCopy)
                             +initialFermionAction-finalFermionAction
                             +pvAction(settings, chi_pv,gaugeLinks)-pvAction(settings,chi_pv,gaugeLinksCopy))
 
-    if(r<metroFactor):
-        success=True
-        gaugeLinks = gaugeLinksCopy
-        gaugeLinks/= jnp.abs(gaugeLinks)
-    else:
-        success=False
+    success = r<metroFactor
+
+    gaugeLinksOut = jnp.where(success,
+                           gaugeLinksCopy/jnp.abs(gaugeLinksCopy),
+                           gaugeLinks)
+
+    #return worst error so that convergence failure can be caught
+    worstRes = jnp.maximum(resPV, jnp.maximum(resInitial, resFinal))
 
     #metroFactor = exp(-dH), useful for the <exp(-dH)>=1 consistency check
-    return gaugeLinks, success, metroFactor
+    return gaugeLinksOut, success, metroFactor, worstRes
 
 
 def hmcChain(modelSettings:dwfParams, metroSteps=1000, numSubSteps = 10,
@@ -228,8 +294,11 @@ def hmcChain(modelSettings:dwfParams, metroSteps=1000, numSubSteps = 10,
 
     chainKey = jax.random.key(seed)
 
+    #host-side archive, filled per step (also pulls each config off the device)
     linkHistory = np.full((metroSteps, modelSettings.dimx,modelSettings.dimt,2),1+0j)
-    gaugeLinks = jnp.full((modelSettings.dimx,modelSettings.dimt,2),1+0j)
+    #explicit dtype: a weakly-typed initial array has a different jit signature
+    #than the strongly-typed one hmcStep returns, forcing a second compile
+    gaugeLinks = jnp.full((modelSettings.dimx,modelSettings.dimt,2),1+0j,dtype=jnp.complex128)
 
     #per-step metropolis accept/reject record, filled by hmcChain
     acceptHistory = np.zeros(metroSteps, dtype=bool)
@@ -237,56 +306,111 @@ def hmcChain(modelSettings:dwfParams, metroSteps=1000, numSubSteps = 10,
     for currentStep in tqdm(range(metroSteps), position=tqdmPosition, leave=True):
         stepKey = jax.random.fold_in(chainKey, currentStep)
 
-        gaugeLinks, acceptHistory[currentStep], _ = hmcStep(modelSettings, gaugeLinks,stepKey,
+        gaugeLinks, acceptHistory[currentStep], _, worstRes = hmcStep(modelSettings, gaugeLinks,stepKey,
                                                           numSubSteps=numSubSteps,
                                                           cgRtolForce=cgRtolForce,cgRtolAction=cgRtolAction)
 
+        if float(worstRes) > 10 * cgRtolAction:
+            raise RuntimeError(f"action/heat-bath CG failed: residual {float(worstRes):.3e}")
 
         linkHistory[currentStep] = gaugeLinks
     
     return modelSettings, linkHistory, acceptHistory
 
 
+#chains live on axis 0 of gaugeLinks and rngKeys; settings/substeps/tolerances are
+#shared. in_axes pairs with positional args only, so call this positionally:
+#hmcStepBatch(settings, gaugeLinks, chainKeys, numSubSteps, cgRtolForce, cgRtolAction)
+hmcStepBatch = partial(jax.jit, static_argnums=(0, 3))(
+    jax.vmap(hmcStep, in_axes=(None, 0, 0, None, None, None)))
+
+
+def hmcChainBatch(modelSettings: dwfParams, nChains, metroSteps=1000, numSubSteps=10,
+                  cgRtolForce=1e-5, cgRtolAction=1e-10, seed=0, tqdmPosition=0):
+    """Runs nChains chains in lockstep on the device via hmcStepBatch.
+
+    Chain c's randomness at step n is deterministic in (seed, n, c), so a single
+    seed reproduces the whole ensemble. Returns host arrays
+      linkHistory   : (metroSteps, nChains, dimx, dimt, 2) complex
+      acceptHistory : (metroSteps, nChains) bool
+    """
+    masterKey = jax.random.key(seed)
+
+    gaugeLinks = jnp.full((nChains, modelSettings.dimx, modelSettings.dimt, 2),
+                          1+0j, dtype=jnp.complex128)
+
+    linkHistory = np.zeros((metroSteps, nChains, modelSettings.dimx, modelSettings.dimt, 2),
+                           dtype=complex)
+    acceptHistory = np.zeros((metroSteps, nChains), dtype=bool)
+
+    for currentStep in tqdm(range(metroSteps), position=tqdmPosition, leave=True):
+        chainKeys = jax.random.split(jax.random.fold_in(masterKey, currentStep), nChains)
+
+        gaugeLinks, accept, _, worstRes = hmcStepBatch(modelSettings, gaugeLinks, chainKeys,
+                                                       numSubSteps, cgRtolForce, cgRtolAction)
+
+        worst = float(jnp.max(worstRes))
+        if worst > 10 * cgRtolAction:
+            raise RuntimeError(f"action/heat-bath CG failed: residual {worst:.3e}")
+
+        acceptHistory[currentStep] = np.asarray(accept)
+        linkHistory[currentStep] = np.asarray(gaugeLinks)
+
+    return linkHistory, acceptHistory
+
 
 def _applyD_core(settings: dwfParams, gaugeLinks, psi, sign):
+    """D (sign=+1) or D^dagger (sign=-1): fused CUDA kernel when built, XLA otherwise."""
+    if _USE_CUDA_KERNEL:
+        return _dwf_cuda.applyD(settings, gaugeLinks, psi, sign)
+    return _applyD_xla(settings, gaugeLinks, psi, sign)
+
+
+def _applyD_xla(settings: dwfParams, gaugeLinks, psi, sign):
     """Shared body for D (sign=+1) and D^dagger (sign=-1).
 
     The gammas are Hermitian and the link placement is symmetric under the
     conjugate transpose, so D^dagger is D with every gamma negated: the
     forward/backward spin factors (1 -+ gamma) swap, and P- <-> P+ in s5.
     """
+
+    #typing so that mixed precision works
+    dataType = psi.dtype
+    realType = jnp.zeros((), dataType).real.dtype          # f32 for c64, f64 for c128
+    GX, GT, G5 = _GAMMA_X.astype(dataType), _GAMMA_T.astype(dataType), _GAMMA_5.astype(dataType)
+
     a = settings.a
     Ut = gaugeLinks[:, :, 0][None, :, :, None]  # (1, dimx, dimt, 1)
     Ux = gaugeLinks[:, :, 1][None, :, :, None]
 
     I2 = jnp.eye(2, dtype=psi.dtype)
-    P_fwd5 = (I2 - sign * _GAMMA_5) / 2   # P- for D, P+ for D^dagger
-    P_bwd5 = (I2 + sign * _GAMMA_5) / 2
+    P_fwd5 = (I2 - sign * G5) / 2   # P- for D, P+ for D^dagger
+    P_bwd5 = (I2 + sign * G5) / 2
 
     #diagonal: Wilson (−M5 + 2/a) plus the identity from D5
     out = (1 - settings.M5 + 2 / a) * psi
 
     #anti-periodic boundary in time: sign flip where roll wraps around
-    bc_fwd = jnp.ones(settings.dimt).at[-1].set(-1.0)[None, None, :, None]
-    bc_bwd = jnp.ones(settings.dimt).at[0].set(-1.0)[None, None, :, None]
+    bc_fwd = jnp.ones(settings.dimt,dtype=realType).at[-1].set(-1.0)[None, None, :, None]
+    bc_bwd = jnp.ones(settings.dimt,dtype=realType).at[0].set(-1.0)[None, None, :, None]
 
     # +x hop: -1/2a * Ux(x,t) (1∓γx) ψ(x+1,t)
-    out -= (1 / (2 * a)) * Ux * jnp.einsum('ij,sxtj->sxti', I2 - sign * _GAMMA_X,
+    out -= (1 / (2 * a)) * Ux * jnp.einsum('ij,sxtj->sxti', I2 - sign * GX,
                                            jnp.roll(psi, -1, axis=1))
     # -x hop: -1/2a * Ux*(x-1,t) (1±γx) ψ(x-1,t)
     out -= (1 / (2 * a)) * jnp.roll(jnp.conj(Ux), 1, axis=1) \
-           * jnp.einsum('ij,sxtj->sxti', I2 + sign * _GAMMA_X, jnp.roll(psi, 1, axis=1))
+           * jnp.einsum('ij,sxtj->sxti', I2 + sign * GX, jnp.roll(psi, 1, axis=1))
     # +t hop: -1/2a * Ut(x,t) (1∓γt) ψ(x,t+1)
-    out -= (1 / (2 * a)) * Ut * jnp.einsum('ij,sxtj->sxti', I2 - sign * _GAMMA_T,
+    out -= (1 / (2 * a)) * Ut * jnp.einsum('ij,sxtj->sxti', I2 - sign * GT,
                                            bc_fwd * jnp.roll(psi, -1, axis=2))
     # -t hop: -1/2a * Ut*(x,t-1) (1±γt) ψ(x,t-1)
     out -= (1 / (2 * a)) * jnp.roll(jnp.conj(Ut), 1, axis=2) \
-           * jnp.einsum('ij,sxtj->sxti', I2 + sign * _GAMMA_T, bc_bwd * jnp.roll(psi, 1, axis=2))
+           * jnp.einsum('ij,sxtj->sxti', I2 + sign * GT, bc_bwd * jnp.roll(psi, 1, axis=2))
 
     #5th-dimension hops: the roll wrap-around carries a factor of -fMass so the
     #mass terms +m P appear on the boundaries
-    m_fwd = jnp.ones(settings.dim5).at[-1].set(-settings.fMass)[:, None, None, None]
-    m_bwd = jnp.ones(settings.dim5).at[0].set(-settings.fMass)[:, None, None, None]
+    m_fwd = jnp.ones(settings.dim5,dtype=realType).at[-1].set(-settings.fMass)[:, None, None, None]
+    m_bwd = jnp.ones(settings.dim5,dtype=realType).at[0].set(-settings.fMass)[:, None, None, None]
 
     out -= m_fwd * jnp.einsum('ij,sxtj->sxti', P_fwd5, jnp.roll(psi, -1, axis=0))
     out -= m_bwd * jnp.einsum('ij,sxtj->sxti', P_bwd5, jnp.roll(psi, 1, axis=0))

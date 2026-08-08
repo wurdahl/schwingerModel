@@ -534,7 +534,10 @@ def prinCorrelOverFit(prinCorrels, masses, labels=None, state=0, fitT=None,
             # meaningless within noise of that point, so blank it rather than
             # letting one near-zero division set the panel's scale
             fit[np.abs(fit) < 1e-12] = np.nan
-            ratio = (central[:, state] / fit)[sel]
+            # the periodic factor inside fitCurve carries |.| (the mass fit runs
+            # in log space), so ratio |data| against it: past a sinh crossing the
+            # ratio then returns to +1 instead of sitting at -1 off-panel
+            ratio = (np.abs(central[:, state]) / fit)[sel]
             # err rows are [high-central, central-low]; matplotlib wants
             # [lower, upper]. A negative entry means the central value fell
             # outside its own bootstrap band (bias at noisy t) — clip that side

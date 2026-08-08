@@ -47,7 +47,7 @@ def buildDiracOp(modelSettings: LatticeParams, gaugeLinks, chemicalPot=0):
 
     return Dee
 
-def buildDomainWall5(modelSettings: dwfParams, gaugeLinks):
+def buildDomainWall5(modelSettings: dwfParams):
     Pminus = (np.eye(2) - modelSettings.gamma5)/2
     Pplus  = (np.eye(2) + modelSettings.gamma5)/2
 
@@ -83,7 +83,7 @@ def buildDwfOp(modelSettings: dwfParams, gaugeLinks):
 
     dim5Id = sparse.eye_array(modelSettings.dim5)
 
-    return sparse.kron(dim5Id, wilsonOp) + buildDomainWall5(modelSettings, gaugeLinks)
+    return sparse.kron(dim5Id, wilsonOp) + buildDomainWall5(modelSettings)
 
 
 def applyCovDerivative(modelSettings: LatticeParams, gaugeLinks, fields):

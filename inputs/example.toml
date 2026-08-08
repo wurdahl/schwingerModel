@@ -19,6 +19,8 @@ dimt = 16
 targetConfigs = 5000   #total thermalized configurations after merging chains
 burnIn = 500           #discarded from the START of each chain before merging
 nCores = 10            #optional, default: all cores
+#backend = "cpu"       #optional: "cpu" (joblib chains, default) or "gpu"
+#                      #(vmapped jax chains; dwf only, nCores ignored, ~64 chains is the sweet spot)
 #nChains = 10          #optional, default: nCores (chain i uses randSeed + i)
 #randSeed = 0          #optional base seed
 #cgRtolForce = 1e-5    #optional CG tolerance for the MD force solves (metropolis-corrected, may run loose)

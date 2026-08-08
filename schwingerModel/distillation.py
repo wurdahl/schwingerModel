@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import scipy.sparse as sparse
-from scipy.sparse.linalg import splu
+from scipy.sparse.linalg import splu, cg
 from scipy.stats import bootstrap
 from scipy.optimize import curve_fit
 from tqdm import tqdm
@@ -96,7 +96,7 @@ def buildPerambulator(modelSettings: LatticeParams, gaugeLinks, eigVecs, chemica
 
     return tau
 
-def buildDwfPerambulator(modelSettings: dwfParams, gaugeLinks, eigVecs):
+def buildDwfPerambulator(modelSettings: dwfParams, gaugeLinks, eigVecs, cgRtol=1e-10):
     """
     Domain wall version of buildPerambulator: same tau shape and index meaning,
     but the physical 2D propagator is the 5D inverse taken between the walls,
@@ -115,7 +115,23 @@ def buildDwfPerambulator(modelSettings: dwfParams, gaugeLinks, eigVecs):
     N5 = modelSettings.dim5
     N2 = N_x*N_t*2      # each 5th-dim slice has the full 2D (x, t, spin) layout
 
-    lu = splu(ops.buildDwfOp(modelSettings, gaugeLinks).tocsc())
+    #solve through the normal equations, x = Ddag (D Ddag)^{-1} b = D^{-1} b:
+    #D Ddag is Hermitian positive-definite so CG applies. A direct splu of the
+    #5D operator becomes prohibitively slow/memory-hungry above ~32x32, while
+    #CG at rtol 1e-10 matches it to solver precision, far below statistical
+    #errors (verified against the splu result on a small config).
+    D = ops.buildDwfOp(modelSettings, gaugeLinks)
+    Ddag = D.conj().T.tocsr()
+    DDdag = (D @ Ddag).tocsr()
+
+    def solve(B):
+        X = np.empty_like(B)
+        for j in range(B.shape[1]):
+            y, exitcode = cg(DDdag, B[:, j], rtol=cgRtol)
+            if exitcode != 0:
+                raise RuntimeError(f"perambulator CG failed to converge! Exit code: {exitcode}")
+            X[:, j] = Ddag @ y
+        return X
 
     tau = np.zeros((N_t, N_t, N_vec, 2, N_vec, 2), dtype=complex)
 
@@ -127,7 +143,7 @@ def buildDwfPerambulator(modelSettings: dwfParams, gaugeLinks, eigVecs):
             wall = 0 if s == 0 else N5-1
             B[np.ix_(wall*N2 + rows2d, np.arange(N_vec)*2 + s)] = eigVecs[t_src]  # (N_x, N_vec)
 
-        Phi5 = lu.solve(B).reshape(N5, N_x, N_t, 2, N_vec, 2)
+        Phi5 = solve(B).reshape(N5, N_x, N_t, 2, N_vec, 2)
         # (s5, x, t_sink, s_sink, k_src, s_src) -> extract at the sink walls
         Phi = np.empty((N_x, N_t, 2, N_vec, 2), dtype=complex)
         Phi[:, :, 0] = Phi5[N5-1, :, :, 0]
