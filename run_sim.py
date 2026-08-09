@@ -10,6 +10,7 @@ automatically by scanning pilot chains until the target metropolis acceptance
 rate is reached. See inputs/example.toml for all recognized fields.
 """
 
+import math
 import os
 import sys
 import tomllib
@@ -102,36 +103,59 @@ def pilotAcceptance(cfg, numSubSteps):
 
 def tuneSubSteps(cfg):
     """
-    Scans substep counts until the target acceptance is reached: doubling to
-    bracket, then bisecting to the smallest passing count (within ~10%).
+    Finds the smallest substep count meeting the target acceptance.
+
+    While no passing count is known, each step extrapolates to the target along
+    the measured acceptance-vs-substeps slope (a secant/Newton step), clamped to
+    [n+1, 2n] so one noisy slope can neither stall nor run away, and never past
+    maxSubSteps — the cap itself is tried before giving up. Once a fail/pass
+    bracket exists, secant steps through its endpoints (midpoint fallback)
+    narrow it to ~10% granularity. Pilot acceptances are noisy; the tolerance
+    absorbs that.
     """
     target = cfg['targetAcceptance']
+    maxN = cfg['maxSubSteps']
+    results = {}                    # substeps -> measured acceptance
+    order = []                      # evaluation order, for the growth-phase secant
 
-    lo = None                       # last failing count
-    hi = cfg['startSubSteps']
-    while hi <= cfg['maxSubSteps']:
-        acc = pilotAcceptance(cfg, hi)
-        tqdm.write(f"  substeps {hi:4d}: acceptance {acc:.2f}")
+    def measure(n):
+        acc = pilotAcceptance(cfg, n)
+        tqdm.write(f"  substeps {n:4d}: acceptance {acc:.2f}")
+        results[n] = acc
+        order.append(n)
+        return acc
+
+    def secant(n1, n2, fallback):
+        """Substep count where the line through both measurements hits target."""
+        if n1 is None or n1 == n2:
+            return fallback
+        slope = (results[n2] - results[n1]) / (n2 - n1)
+        if slope <= 0:              # pilot noise: acceptance rises with substeps
+            return fallback
+        return n2 + (target - results[n2]) / slope
+
+    n = min(cfg['startSubSteps'], maxN)
+    lo, hi = None, None             # largest failing / smallest passing count
+    while True:
+        acc = measure(n)
         if acc >= target:
-            break
-        lo, hi = hi, hi*2
-    else:
-        raise RuntimeError(f"acceptance {target} not reached by {cfg['maxSubSteps']} substeps")
-
-    if lo is None:
-        return hi
-
-    #bisect the bracket [lo (fail), hi (pass)] down to ~10% granularity
-    while hi - lo > max(1, hi//10):
-        mid = (lo + hi)//2
-        acc = pilotAcceptance(cfg, mid)
-        tqdm.write(f"  substeps {mid:4d}: acceptance {acc:.2f}")
-        if acc >= target:
-            hi = mid
+            hi = n if hi is None else min(hi, n)
         else:
-            lo = mid
+            lo = n if lo is None else max(lo, n)
 
-    return hi
+        if hi is not None:
+            if lo is None or hi - lo <= max(1, hi//10):
+                return hi
+            #narrow the bracket: secant through its endpoints, midpoint fallback
+            guess = secant(lo, hi, (lo + hi)/2)
+            n = min(max(math.ceil(guess), lo + 1), hi - 1)
+        else:
+            if n >= maxN:
+                raise RuntimeError(f"acceptance {target} not reached by {maxN} substeps")
+            #grow: secant through the last two points, doubling fallback
+            prev = order[-2] if len(order) > 1 else None
+            guess = secant(prev, n, 2*n)
+            n = min(max(math.ceil(guess), n + 1), 2*n, maxN)
 
 
 def main(inputPath):
