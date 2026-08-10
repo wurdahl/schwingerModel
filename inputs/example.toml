@@ -28,12 +28,30 @@ nCores = 10            #optional, default: all cores
 #cgRtol = 1e-5         #deprecated: old single tolerance, honored as cgRtolForce
 
 [substeps]
-#give numSubSteps to use a fixed value, or omit it to tune automatically:
-#pilot chains scan substep counts (doubling then bisection) until the
-#metropolis acceptance, measured on the second half of the pilot, reaches
-#targetAcceptance
+#give numSubSteps to use a fixed value, or omit it to tune automatically.
+#
+#tuning reads each pilot as a measurement of the integrator's energy error:
+#<dH> = C * n^-p and P = erfc(sqrt(<dH>/2)), so a measured acceptance inverts
+#to <dH> and the substep count hitting targetAcceptance follows from the model.
+#The first pilot already predicts an answer (at the theoretical p = 4); later
+#pilots refit p as well. Typically 4-6 pilots instead of 8.
 numSubSteps = 20
-#targetAcceptance = 0.8
-#pilotSteps = 100
-#startSubSteps = 5
-#maxSubSteps = 500
+#targetAcceptance = 0.8   #acceptance the tuned count must reach
+#pilotSteps = 100         #trajectories per pilot (second half is measured)
+#startSubSteps = 5        #first count tried
+#maxSubSteps = 500        #hard ceiling; unreachable target below it is an error
+#maxPilots = 12           #pilot budget; on exhaustion the best count is used
+#
+#pilotChains: chains per pilot. Defaults to nChains on the gpu (acceptance is
+#per-chain, so a wider batch is cheaper noise reduction than more pilot steps)
+#and to 1 on the cpu.
+#pilotChains = 16
+#
+#confirmSteps: after tuning, re-measure the chosen count on a seed the search
+#never saw, and report the acceptance with its error. The search pilots all
+#share randSeed (common random numbers), so this is what catches a count that
+#only looked good on that one seed. Also runs when numSubSteps is set by hand,
+#so a stale copied value cannot quietly run an ensemble off-target.
+#Defaults to pilotSteps; set 0 to skip (~35% cheaper tuning, ~5x more runs
+#landing more than 0.03 under target).
+#confirmSteps = 100

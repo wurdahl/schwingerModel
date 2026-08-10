@@ -6,15 +6,13 @@ from schwingerModel.distillation_gpu import generateDistillFile
 #Nx=32, with Nx=48/64 held at 100 groups on the wider skip. Everything earlier
 #is done: m=0.05, m=0.02 and the m=0.2 Nx=8/16/32 all sit at those counts.
 #
-#Nx=48/64 are parked below until their ensembles exist: the overnight sweep
-#died on Nx=48 (substep ceiling) and those two volumes get rerun tonight.
-#Uncomment them once configs/..._Nx_48_... and ..._Nx_64_....h5 are on disk.
+#Nx=8/16/32 built on 2026-08-09 morning and are off the list; only the two
+#volumes the first sweep never reached are left. The rerun (maxSubSteps=400)
+#is producing them now, and runDistill_m0.01_Nx48-64.sh fires this file once
+#both ensembles land.
 jobs = [
-    (0.01, 8, 2, 50),
-    (0.01, 16, 2, 50),
-    (0.01, 32, 4, 50),
-    # (0.01, 48, 6, 200),
-    # (0.01, 64, 8, 200),
+    (0.01, 48, 6, 200),
+    (0.01, 64, 8, 200),
 ]
 
 for m, Nx, numVecs, autocorrSkip in jobs:
