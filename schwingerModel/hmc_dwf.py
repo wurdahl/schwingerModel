@@ -154,6 +154,9 @@ def hmcStep(modelSettings:dwfParams, gaugeLinks, numSubSteps=100, rng=None,cgRto
     chi = (rng.normal(loc=0,scale=1/np.sqrt(2),size=(modelSettings.dim5*modelSettings.dimx*modelSettings.dimt*2))
             +1j*rng.normal(loc=0,scale=1/np.sqrt(2),size=(modelSettings.dim5*modelSettings.dimx*modelSettings.dimt*2)))
 
+    #initial fermion action is just \chi.\chi
+    initialFermionAction = np.vdot(chi,chi).real
+
     # phi = self.apply_D_vectorized(chi,self.gaugeLinks)
     phi = buildDwfOp(modelSettings,gaugeLinks)@chi
 
@@ -189,7 +192,7 @@ def hmcStep(modelSettings:dwfParams, gaugeLinks, numSubSteps=100, rng=None,cgRto
 
     metroFactor = np.exp(0.5*np.sum(conjPInitial**2)-0.5*np.sum(conjP**2)
                             +totalAction(modelSettings, gaugeLinks)-totalAction(modelSettings, gaugeLinksCopy)
-                            +pseudoBilinear(modelSettings, phi,gaugeLinks,cgRtolAction)-pseudoBilinear(modelSettings,phi,gaugeLinksCopy,cgRtolAction)
+                            +initialFermionAction-pseudoBilinear(modelSettings,phi,gaugeLinksCopy,cgRtolAction)
                             +pvAction(modelSettings, chi_pv,gaugeLinks)-pvAction(modelSettings,chi_pv,gaugeLinksCopy))
     r=rng.random()
     if(r<metroFactor):

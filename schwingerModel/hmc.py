@@ -224,6 +224,9 @@ def hmcStep(modelSettings:LatticeParams, gaugeLinks, numSubSteps=100, rng=None,c
     chi = (rng.normal(loc=0,scale=1/np.sqrt(2),size=(modelSettings.dimx*modelSettings.dimt*2))
             +1j*rng.normal(loc=0,scale=1/np.sqrt(2),size=(modelSettings.dimx*modelSettings.dimt*2)))
 
+    #initial fermion action is just \chi.\chi
+    initialFermionAction = np.vdot(chi,chi).real
+
     # phi = self.apply_D_vectorized(chi,self.gaugeLinks)
     phi = buildDiracOp(modelSettings,gaugeLinks)@chi
 
@@ -246,7 +249,7 @@ def hmcStep(modelSettings:LatticeParams, gaugeLinks, numSubSteps=100, rng=None,c
     #so the action solves get the tighter tolerance
     metroFactor = np.exp(0.5*np.sum(conjPInitial**2)-0.5*np.sum(conjP**2)
                             +totalAction(modelSettings, gaugeLinks)-totalAction(modelSettings, gaugeLinksCopy)
-                            +pseudoBilinear(modelSettings, phi,gaugeLinks,cgRtolAction)-pseudoBilinear(modelSettings,phi,gaugeLinksCopy,cgRtolAction))
+                            +initialFermionAction-pseudoBilinear(modelSettings,phi,gaugeLinksCopy,cgRtolAction))
     r=rng.random()
     if(r<metroFactor):
         success=True

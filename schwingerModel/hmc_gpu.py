@@ -231,6 +231,9 @@ def hmcStep(settings:dwfParams, gaugeLinks, rngKey,  numSubSteps=100, cgRtolForc
     conjPInitial = jax.random.normal(kMom, (settings.dimx, settings.dimt, 2))
     r = jax.random.uniform(kMetro)
 
+    #initial fermion action is just \chi.\chi
+    initialFermionAction = jnp.vdot(chi,chi).real
+
     #copy current gauge configuration
     gaugeLinksCopy = jnp.copy(gaugeLinks)
 
@@ -267,7 +270,6 @@ def hmcStep(settings:dwfParams, gaugeLinks, rngKey,  numSubSteps=100, cgRtolForc
     Force, X = hmcForcingFunction_vec(settings,gaugeLinksCopy,phi,chi_pv, x0=X,cgRtol=cgRtolForce)
     conjP = conjP - epsilon/2 * Force
 
-    initialFermionAction, resInitial = pseudoBilinear(settings, phi,gaugeLinks,cgRtolAction)
     finalFermionAction, resFinal = pseudoBilinear(settings, phi,gaugeLinksCopy,cgRtolAction)
 
     metroFactor = jnp.exp(0.5*jnp.sum(conjPInitial**2)-0.5*jnp.sum(conjP**2)
@@ -282,7 +284,7 @@ def hmcStep(settings:dwfParams, gaugeLinks, rngKey,  numSubSteps=100, cgRtolForc
                            gaugeLinks)
 
     #return worst error so that convergence failure can be caught
-    worstRes = jnp.maximum(resPV, jnp.maximum(resInitial, resFinal))
+    worstRes = jnp.maximum(resPV, resFinal)
 
     #metroFactor = exp(-dH), useful for the <exp(-dH)>=1 consistency check
     return gaugeLinksOut, success, metroFactor, worstRes
