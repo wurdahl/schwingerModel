@@ -17,7 +17,8 @@ def _checkDwfOnly(fermionAction, tunneling):
 def acceptanceFractions(beta=10, fMass=1, aSpacing=1, Nx=4, Nt=4, metroSteps=100, numSubSteps=10,
                         tunneling=False, cgRtolForce=1e-5, cgRtolAction=1e-10,
                         fermionAction="dwf", dim5=None, M5=None,
-                        seed=0, tqdmPosition=0, measureFrom=0.5, chains=8):
+                        seed=0, tqdmPosition=0, measureFrom=0.5, chains=8,
+                        coldStartForce=False):
     """GPU mirror of experiment.acceptanceFractions, call-compatible so run_sim can
     route to either. Returns (hmcFraction, tunnelFraction); tunnelFraction is always 0.
 
@@ -32,7 +33,8 @@ def acceptanceFractions(beta=10, fMass=1, aSpacing=1, Nx=4, Nt=4, metroSteps=100
     _, acceptHistory = hmc_gpu.hmcChainBatch(settings, chains, metroSteps=metroSteps,
                                              numSubSteps=numSubSteps,
                                              cgRtolForce=cgRtolForce, cgRtolAction=cgRtolAction,
-                                             seed=seed, tqdmPosition=tqdmPosition)
+                                             seed=seed, tqdmPosition=tqdmPosition,
+                                             coldStartForce=coldStartForce)
 
     start = int(metroSteps * measureFrom)
     return acceptHistory[start:].mean(), 0.0
@@ -43,7 +45,8 @@ def runExperiment(path, beta=10, fMass=1, aSpacing=1, Nx=4, Nt=4, metroSteps=100
                   cgRtolForce=1e-5, cgRtolAction=1e-10,
                   dim5=None, M5=None,
                   randSeed=0, overwrite=False,
-                  tunneling=False, cores=None, fermionAction="dwf"):
+                  tunneling=False, cores=None, fermionAction="dwf",
+                  coldStartForce=False):
     """GPU mirror of experiment.runExperiment for the dwf action: the chains run in
     lockstep on the device through hmc_gpu.hmcChainBatch instead of joblib workers.
 
@@ -72,7 +75,8 @@ def runExperiment(path, beta=10, fMass=1, aSpacing=1, Nx=4, Nt=4, metroSteps=100
                                                        numSubSteps=numSubSteps,
                                                        cgRtolForce=cgRtolForce,
                                                        cgRtolAction=cgRtolAction,
-                                                       seed=randSeed)
+                                                       seed=randSeed,
+                                                       coldStartForce=coldStartForce)
 
     #(steps, chains, ...) -> (chains, steps, ...), then the same per-chain
     #burn-in trim and chain merge as the CPU runner
@@ -82,6 +86,6 @@ def runExperiment(path, beta=10, fMass=1, aSpacing=1, Nx=4, Nt=4, metroSteps=100
     saveEnsemble(path, settings, linkHistory, acceptHistory, tunnelAcceptance=None,
                  tunneling=False, cgRtolForce=cgRtolForce, cgRtolAction=cgRtolAction,
                  numSubSteps=numSubSteps, seeds=np.array([randSeed]),
-                 fermionAction="dwf", overwrite=overwrite)
+                 fermionAction="dwf", overwrite=overwrite, coldStartForce=coldStartForce)
 
     return path

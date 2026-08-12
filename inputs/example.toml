@@ -26,6 +26,13 @@ nCores = 10            #optional, default: all cores
 #cgRtolForce = 1e-5    #optional CG tolerance for the MD force solves (metropolis-corrected, may run loose)
 #cgRtolAction = 1e-10  #optional CG tolerance for the action solves in dH (kept tight; errors here bias the ensemble)
 #cgRtol = 1e-5         #deprecated: old single tolerance, honored as cgRtolForce
+#coldStartForce = false #optional: restart every force CG from zero instead of
+#                      #warm-starting from the previous substep. Warm starts
+#                      #make the force depend on trajectory history, which
+#                      #breaks leapfrog reversibility and measurably violates
+#                      #<exp(-dH)>=1 (0.92-0.97 at m=0.01 Nx=64); cold starts
+#                      #restore exactness at ~40% more solve time. Recorded in
+#                      #the ensemble attrs as coldStartForce.
 
 [substeps]
 #give numSubSteps to use a fixed value, or omit it to tune automatically.

@@ -140,7 +140,8 @@ def pvAction(modelSettings: dwfParams, chi_pv, gaugeLinks):
     v = D_pv @ chi_pv
     return np.vdot(v, v).real
 
-def hmcStep(modelSettings:dwfParams, gaugeLinks, numSubSteps=100, rng=None,cgRtolForce=1e-5,cgRtolAction=1e-10):
+def hmcStep(modelSettings:dwfParams, gaugeLinks, numSubSteps=100, rng=None,cgRtolForce=1e-5,cgRtolAction=1e-10,
+            coldStartForce=False):
     #a shared default generator would correlate independent callers, so make a fresh one
     if rng is None:
         rng = np.random.default_rng()
@@ -181,13 +182,18 @@ def hmcStep(modelSettings:dwfParams, gaugeLinks, numSubSteps=100, rng=None,cgRto
     #first momentum half step:
     Force, X = hmcForcingFunction_vec(modelSettings, gaugeLinksCopy,phi,chi_pv,cgRtol=cgRtolForce)
     conjP = conjPInitial - epsilon/2 * Force
+    #coldStartForce: restart every force CG from zero so the force is a
+    #deterministic function of U and the leapfrog stays exactly reversible
+    #(warm starts measurably violate <exp(-dH)>=1); costs ~40% more solve time
     for i in range(numSubSteps-1):
         gaugeLinksCopy *= np.exp(1j*epsilon *conjP)
-        Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,chi_pv,x0=X,cgRtol=cgRtolForce)
+        Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,chi_pv,
+                                          x0=None if coldStartForce else X,cgRtol=cgRtolForce)
         conjP = conjP - epsilon * Force
     #last step
     gaugeLinksCopy *= np.exp(1j*epsilon *conjP)
-    Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,chi_pv, x0=X,cgRtol=cgRtolForce)
+    Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,chi_pv,
+                                      x0=None if coldStartForce else X,cgRtol=cgRtolForce)
     conjP = conjP - epsilon/2 * Force
 
     metroFactor = np.exp(0.5*np.sum(conjPInitial**2)-0.5*np.sum(conjP**2)
@@ -207,7 +213,7 @@ def hmcStep(modelSettings:dwfParams, gaugeLinks, numSubSteps=100, rng=None,cgRto
 
 def hmcChain(modelSettings:dwfParams, metroSteps=1000, numSubSteps = 10,
               cgRtolForce=1e-5, cgRtolAction=1e-10,
-              seed=0, tqdmPosition=0):
+              seed=0, tqdmPosition=0, coldStartForce=False):
 
     rng = np.random.default_rng(seed)
 
@@ -221,7 +227,8 @@ def hmcChain(modelSettings:dwfParams, metroSteps=1000, numSubSteps = 10,
 
         gaugeLinks, acceptHistory[currentStep], _ = hmcStep(modelSettings, gaugeLinks,
                                                           numSubSteps=numSubSteps, rng=rng,
-                                                          cgRtolForce=cgRtolForce,cgRtolAction=cgRtolAction)
+                                                          cgRtolForce=cgRtolForce,cgRtolAction=cgRtolAction,
+                                                          coldStartForce=coldStartForce)
 
 
         linkHistory[currentStep] = gaugeLinks

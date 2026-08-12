@@ -47,8 +47,13 @@ LW = 2.5        # standard curve linewidth
 GREY = "0.8"    # reference lines (zero, thresholds, asymptotes)
 BAND = "0.93"   # shaded regions (fit windows)
 
-# white-filled markers, thick everything, no connecting line
-eb_kw = dict(ms=8, mfc="white", mew=2.0, elinewidth=2.0, capsize=3.5,
+# white-filled markers, thick everything, no connecting line.
+# capsize: caps span 2*capsize points and the symbol spans ms points, so caps
+# need 2*capsize >= ms + ~6pt to stay visible PAST the marker's sides even when
+# the whole error bar is smaller than the symbol — otherwise tiny errors vanish
+# behind the white fill and read as "no error measured". At ms=8 that means
+# capsize >= 7; keep the margin if ms ever grows.
+eb_kw = dict(ms=8, mfc="white", mew=2.0, elinewidth=2.0, capsize=7.0,
              capthick=2.0, ls="none", zorder=3)
 
 # Backing for hand-placed text. Fully transparent by default: any nonzero alpha

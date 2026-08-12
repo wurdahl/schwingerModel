@@ -324,7 +324,11 @@ def generateDistillFile(ensemblePath, filePath, numVecs,
         meta = {"dimx": modelSettings.dimx, "dimt": modelSettings.dimt, "a": modelSettings.a,
                 "fMass": modelSettings.fMass, "beta": modelSettings.beta,
                 "numVecs": numVecs, "version": FILE_VERSION,
-                "fermionAction": "dwf" if isinstance(modelSettings, dwfParams) else "wilson"}
+                "fermionAction": "dwf" if isinstance(modelSettings, dwfParams) else "wilson",
+                #propagated from the ensemble so the cache records how its
+                #configs were generated (see saveEnsemble); part of the
+                #consistency check, so a cache cannot silently mix the two
+                "coldStartForce": bool(ens.attrs["coldStartForce"])}
         if isinstance(modelSettings, dwfParams):
             meta["dim5"] = modelSettings.dim5
             meta["M5"] = modelSettings.M5

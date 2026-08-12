@@ -210,7 +210,8 @@ def hmcForcingFunction_vec(settings: LatticeParams, gaugeLinks, phis, x0=None, c
 #do one step of an hmc metropolis algorithm
 #returns boolean of success of total step
 #if successful, replaces global value of gaugeLinks
-def hmcStep(modelSettings:LatticeParams, gaugeLinks, numSubSteps=100, rng=None,cgRtolForce=1e-5,cgRtolAction=1e-10):
+def hmcStep(modelSettings:LatticeParams, gaugeLinks, numSubSteps=100, rng=None,cgRtolForce=1e-5,cgRtolAction=1e-10,
+            coldStartForce=False):
     #a shared default generator would correlate independent callers, so make a fresh one
     if rng is None:
         rng = np.random.default_rng()
@@ -236,13 +237,18 @@ def hmcStep(modelSettings:LatticeParams, gaugeLinks, numSubSteps=100, rng=None,c
     #first momentum half step:
     Force, X = hmcForcingFunction_vec(modelSettings, gaugeLinksCopy,phi,cgRtol=cgRtolForce)
     conjP = conjPInitial - epsilon/2 * Force
+    #coldStartForce: restart every force CG from zero so the force is a
+    #deterministic function of U and the leapfrog stays exactly reversible
+    #(warm starts measurably violate <exp(-dH)>=1); costs ~40% more solve time
     for i in range(numSubSteps-1):
         gaugeLinksCopy *= np.exp((1j)*epsilon *conjP)
-        Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,x0=X,cgRtol=cgRtolForce)
+        Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,
+                                          x0=None if coldStartForce else X,cgRtol=cgRtolForce)
         conjP = conjP - epsilon * Force
     #last step
     gaugeLinksCopy *= np.exp((1j)*epsilon *conjP)
-    Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,x0=X,cgRtol=cgRtolForce)
+    Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,
+                                      x0=None if coldStartForce else X,cgRtol=cgRtolForce)
     conjP = conjP - epsilon/2 * Force
 
     #force errors are metropolis-corrected, but errors here enter dH directly,
@@ -289,7 +295,7 @@ def tunnelStep(modelSettings:LatticeParams, gaugeLinks,rng=None):
 
 def hmcChain(modelSettings:LatticeParams, metroSteps=1000, numSubSteps = 10,
              cgRtolForce=1e-5, cgRtolAction=1e-10,
-             tunneling=True, seed=0, tqdmPosition=0):
+             tunneling=True, seed=0, tqdmPosition=0, coldStartForce=False):
 
     rng = np.random.default_rng(seed)
 
@@ -304,7 +310,8 @@ def hmcChain(modelSettings:LatticeParams, metroSteps=1000, numSubSteps = 10,
 
         gaugeLinks, acceptHistory[currentStep] = hmcStep(modelSettings, gaugeLinks,
                                                           numSubSteps=numSubSteps, rng=rng,
-                                                          cgRtolForce=cgRtolForce,cgRtolAction=cgRtolAction)
+                                                          cgRtolForce=cgRtolForce,cgRtolAction=cgRtolAction,
+                                                          coldStartForce=coldStartForce)
 
         if(tunneling):
             #if doing tunneling steps, do them here

@@ -76,8 +76,13 @@ plt.rcParams.update({
     "svg.fonttype": "none",
 })
 
-# white-filled markers, thick everything, no connecting line
-eb_kw = dict(ms=8, mfc="white", mew=2.0, elinewidth=2.0, capsize=3.5,
+# white-filled markers, thick everything, no connecting line.
+# capsize is deliberately large: caps span 2*capsize points and the symbol
+# spans ms points, so 2*capsize >= ms + ~6pt keeps the cap ends visible PAST
+# the marker's sides even when the whole error bar is smaller than the symbol.
+# Otherwise tiny errors hide behind the white fill and read as "no error
+# measured" — the opposite of what a tiny error should communicate.
+eb_kw = dict(ms=8, mfc="white", mew=2.0, elinewidth=2.0, capsize=7.0,
              capthick=2.0, ls="none", zorder=3)
 
 LW = 2.5          # standard curve linewidth
@@ -377,7 +382,8 @@ Before a figure leaves the notebook:
 - [ ] Serif / CM fonts; text as large as the paper's body text
 - [ ] Palette colors only; each series has its own marker shape
 - [ ] Every line `lw >= 2.5`; no dashed or dotted lines
-- [ ] Error bar markers white-filled with thick bars
+- [ ] Error bar markers white-filled with thick bars; caps wider than the
+      symbol so tiny errors stay visible (`sp.eb_kw` does this)
 - [ ] Continuous error → `fill_between`, not a wall of error bars
 - [ ] Zero and any threshold marked in light grey
 - [ ] No `plt.legend()` — colored text block instead

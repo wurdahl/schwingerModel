@@ -47,6 +47,11 @@ def loadInput(path):
         'randSeed': run.get('randSeed', 0),
         'nCores':   run.get('nCores', os.cpu_count()),
         'tunneling': run.get('tunneling', False),
+        #restart every force CG from zero: exactly reversible leapfrog, so
+        #<exp(-dH)>=1 holds exactly, at ~40% more solve time. False (the
+        #default, and how every ensemble before 2026-08 was generated)
+        #warm-starts from the previous substep's solution.
+        'coldStartForce': run.get('coldStartForce', False),
         #where the chains run: "cpu" (joblib workers, default) or "gpu" (vmapped jax)
         'backend': run.get('backend', 'cpu'),
         #sea quark discretization: "wilson" (default) or "dwf" (needs dim5, M5)
@@ -108,6 +113,7 @@ def pilotAcceptance(cfg, numSubSteps, pilotSteps=None, seed=None):
         tunneling=cfg['tunneling'],
         cgRtolForce=cfg['cgRtolForce'], cgRtolAction=cfg['cgRtolAction'],
         fermionAction=cfg['fermionAction'], dim5=cfg['dim5'], M5=cfg['M5'],
+        coldStartForce=cfg['coldStartForce'],
         seed=cfg['randSeed'] if seed is None else seed,
         tqdmPosition=1,   #keep the pilot bar below the tuning report lines
         **extra,
@@ -393,6 +399,7 @@ def main(inputPath):
         perChainBurnIn=cfg['burnIn'],
         cgRtolForce=cfg['cgRtolForce'], cgRtolAction=cfg['cgRtolAction'],
         fermionAction=cfg['fermionAction'], dim5=cfg['dim5'], M5=cfg['M5'],
+        coldStartForce=cfg['coldStartForce'],
         randSeed=cfg['randSeed'],
     )
 

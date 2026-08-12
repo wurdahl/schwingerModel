@@ -1,12 +1,16 @@
-"""GPU domain-wall perambulators: batched CGNE with mixed-precision refinement.
+"""GPU domain-wall perambulators: batched Schur-preconditioned solves with
+mixed-precision refinement.
 
 Mirrors distillation.buildDwfPerambulator (same tau shape, same wall routing,
 same contraction) but solves all source columns on the device through the fused
-CUDA operator kernel. The solver is the standard lattice-QCD "reliable updates"
-scheme: complex64 inner CG solves (fast on consumer cards whose fp64 runs at
-1/64 rate) wrapped in a complex128 outer refinement loop, with a warm-started
-complex128 polish at the end, so the result meets cgRtol in full double
-precision no matter where the fp32 solves stall.
+CUDA operator kernel. Each column is a D^{-1} solve, done on the 5D even/odd
+Schur complement (see hmc_gpu): one variational CGNE on S^dag S over half the
+lattice, with ~1/4 the condition number of the unpreconditioned normal
+equations. The mixed-precision structure is the standard lattice-QCD "reliable
+updates" scheme: complex64 inner solves (fast on consumer cards whose fp64 runs
+at 1/64 rate) wrapped in a complex128 outer refinement loop, with a
+warm-started complex128 polish at the end, so the result meets cgRtol in full
+double precision no matter where the fp32 solves stall.
 
 Deliberately not imported from __init__: importing jax initializes the GPU.
 Use:  from schwingerModel import distillation_gpu
@@ -20,63 +24,60 @@ import jax.numpy as jnp
 from tqdm import tqdm
 
 from .params import dwfParams
-from .hmc_gpu import applyD_dwf, applyDdag_dwf, cg
+from .hmc_gpu import applyD_dwf, packParity, schurSolve
 from . import topology as top
 from .distillation import (FILE_VERSION, _paramsFromAttrs, findPartialEigenBasis,
                            buildElementalSpatial)
 
 
 @partial(jax.jit, static_argnums=0)
-def _cgneBatch64(settings, U64, B64, tol):
-    """Inner c64 solves of (D Ddag) y = b for a batch of columns (lockstep CG)."""
-    op = lambda v: applyD_dwf(settings, U64, applyDdag_dwf(settings, U64, v))
-    return jax.vmap(lambda b: cg(op, b, tol=tol)[0])(B64)
+def _schurBatch64(settings, U64, B64, tol):
+    """Inner c64 Schur solves of D dx = r for a batch of columns (lockstep CG)."""
+    return jax.vmap(lambda b: schurSolve(settings, U64, b, +1, tol)[0])(B64)
 
 
 @partial(jax.jit, static_argnums=0)
-def _cgneBatch128(settings, U128, B, X0, tol):
-    """c128 polish solves, warm-started from the refined c64 accumulate."""
-    op = lambda v: applyD_dwf(settings, U128, applyDdag_dwf(settings, U128, v))
-    return jax.vmap(lambda b, x0: cg(op, b, x0=x0, tol=tol)[0])(B, X0)
+def _schurBatch128(settings, U128, B, X0, tol):
+    """c128 polish solves, warm-started from the refined c64 accumulate's odd half
+    (the even half is recomputed exactly by the back-substitution)."""
+    return jax.vmap(lambda b, x: schurSolve(settings, U128, b, +1, tol,
+                                            x0Odd=packParity(settings, x, 1))[0])(B, X0)
 
 
 @partial(jax.jit, static_argnums=0)
-def _residualBatch(settings, U128, B, Y):
-    op = lambda v: applyD_dwf(settings, U128, applyDdag_dwf(settings, U128, v))
-    return B - jax.vmap(op)(Y)
-
-
-@partial(jax.jit, static_argnums=0)
-def _ddagBatch(settings, U128, Y):
-    return jax.vmap(lambda v: applyDdag_dwf(settings, U128, v))(Y)
+def _residualBatch(settings, U128, B, X):
+    """b - D x per column: the D-system residual, the quantity the perambulator
+    actually needs accurate (the old normal-equations residual |b - D Ddag y|
+    was the same number in exact arithmetic, since x = Ddag y)."""
+    return B - jax.vmap(lambda v: applyD_dwf(settings, U128, v))(X)
 
 
 def _solveColumns(settings, U128, U64, B, cgRtol, innerTol, maxRefine):
     """x = D^{-1} b per column of B (batch, dim5, dimx, dimt, 2), to cgRtol in c128."""
     bNorm = jnp.sqrt(jnp.sum(jnp.abs(B) ** 2, axis=(1, 2, 3, 4)))
-    y = jnp.zeros_like(B)
+    x = jnp.zeros_like(B)
 
     #c64 refinement passes: each contracts the c128 residual by roughly the
     #attainable fp32 accuracy; stop early once converged or when fp32 stalls
     prev = jnp.inf
     for _ in range(maxRefine):
-        r = _residualBatch(settings, U128, B, y)
+        r = _residualBatch(settings, U128, B, x)
         worst = float(jnp.max(jnp.sqrt(jnp.sum(jnp.abs(r) ** 2, axis=(1, 2, 3, 4))) / bNorm))
         if worst < cgRtol or worst > 0.5 * prev:
             break
         prev = worst
-        dy = _cgneBatch64(settings, U64, r.astype(jnp.complex64), innerTol)
-        y = y + dy.astype(jnp.complex128)
+        dx = _schurBatch64(settings, U64, r.astype(jnp.complex64), innerTol)
+        x = x + dx.astype(jnp.complex128)
 
     #guaranteed finish: warm-started c128 CG takes over whatever is left
-    y = _cgneBatch128(settings, U128, B, y, cgRtol)
+    x = _schurBatch128(settings, U128, B, x, cgRtol)
 
-    r = _residualBatch(settings, U128, B, y)
+    r = _residualBatch(settings, U128, B, x)
     worst = float(jnp.max(jnp.sqrt(jnp.sum(jnp.abs(r) ** 2, axis=(1, 2, 3, 4))) / bNorm))
     if worst > 10 * cgRtol:
-        raise RuntimeError(f"perambulator CGNE failed to converge: relative residual {worst:.3e}")
+        raise RuntimeError(f"perambulator solve failed to converge: relative residual {worst:.3e}")
 
-    return _ddagBatch(settings, U128, y)
+    return x
 
 
 def buildDwfPerambulator(modelSettings: dwfParams, gaugeLinks, eigVecs,
@@ -156,7 +157,10 @@ def generateDistillFile(ensemblePath, filePath, numVecs,
                 "fMass": modelSettings.fMass, "beta": modelSettings.beta,
                 "numVecs": numVecs, "version": FILE_VERSION,
                 "fermionAction": "dwf",
-                "dim5": modelSettings.dim5, "M5": modelSettings.M5}
+                "dim5": modelSettings.dim5, "M5": modelSettings.M5,
+                #propagated from the ensemble (see saveEnsemble); in the
+                #consistency check, so a cache cannot silently mix the two
+                "coldStartForce": bool(ens.attrs["coldStartForce"])}
 
         with h5py.File(filePath, "a") as f:
             for key, val in meta.items():

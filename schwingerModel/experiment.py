@@ -11,7 +11,8 @@ from . import hmc_dwf
 def saveEnsemble(path, modelSettings, linkHistory,
                   acceptHistory, tunnelAcceptance, tunneling,
                   cgRtolForce, cgRtolAction, numSubSteps, seeds,
-                  fermionAction="wilson", dHHistory=None, overwrite=False):
+                  fermionAction="wilson", dHHistory=None, overwrite=False,
+                  coldStartForce=False):
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
@@ -26,6 +27,10 @@ def saveEnsemble(path, modelSettings, linkHistory,
         f.attrs["cgRtolForce"] = cgRtolForce
         f.attrs["cgRtolAction"] = cgRtolAction
         f.attrs["numSubSteps"] = numSubSteps
+        #True: force CG restarted from zero each substep (exactly reversible
+        #leapfrog, <exp(-dH)>=1). False: warm-started (all ensembles before
+        #2026-08 were generated this way; retro-stamped on the v2 files then)
+        f.attrs["coldStartForce"] = coldStartForce
 
         f.attrs["seeds"] = np.asarray(seeds)      # arrays are fine as attrs if small
         f.attrs["version"] = 2
@@ -72,11 +77,15 @@ def loadEnsemble(path):
                                           a=float(f.attrs["a"]))
 
         if version == 1:
-            #v1 ran one tolerance for everything
+            #v1 ran one tolerance for everything, always warm-started
             cgRtolForce = cgRtolAction = float(f.attrs["cgRtol"])
+            coldStartForce = False
         else:
             cgRtolForce = float(f.attrs["cgRtolForce"])
             cgRtolAction = float(f.attrs["cgRtolAction"])
+            #present on every v2 file: written at generation since 2026-08 and
+            #retro-stamped False on the ones from before
+            coldStartForce = bool(f.attrs["coldStartForce"])
 
         #[:] is what actually pulls the data off disk; without it these stay file handles
         return SimpleNamespace(modelSettings=modelSettings,
@@ -88,6 +97,7 @@ def loadEnsemble(path):
                                tunneling=bool(f.attrs["tunneling"]),
                                cgRtolForce=cgRtolForce,
                                cgRtolAction=cgRtolAction,
+                               coldStartForce=coldStartForce,
                                numSubSteps=int(f.attrs["numSubSteps"]),
                                seeds=np.asarray(f.attrs["seeds"]),
                                version=version)
@@ -95,7 +105,7 @@ def loadEnsemble(path):
 def acceptanceFractions(beta=10, fMass=1, aSpacing=1, Nx=4, Nt=4, metroSteps=100, numSubSteps=10,
                         tunneling=False, cgRtolForce=1e-5, cgRtolAction=1e-10,
                         fermionAction="wilson", dim5=None, M5=None,
-                        seed=0, tqdmPosition=0, measureFrom=0.5):
+                        seed=0, tqdmPosition=0, measureFrom=0.5, coldStartForce=False):
     """
     Acceptance probe: runs one short chain and returns (hmcFraction, tunnelFraction)
     without writing anything. Measured over the last (1 - measureFrom) of the chain
@@ -107,13 +117,15 @@ def acceptanceFractions(beta=10, fMass=1, aSpacing=1, Nx=4, Nt=4, metroSteps=100
             raise ValueError("tunneling steps are not implemented for the dwf action")
         settings = dwfParams(beta=beta, dimt=Nt, dimx=Nx, dim5=dim5, fMass=fMass, M5=M5, a=aSpacing)
         _, _, acceptHistory = hmc_dwf.hmcChain(settings, metroSteps, numSubSteps,
-                                               cgRtolForce, cgRtolAction, seed, tqdmPosition)
+                                               cgRtolForce, cgRtolAction, seed, tqdmPosition,
+                                               coldStartForce=coldStartForce)
         tunnelAcceptance = np.zeros(metroSteps, dtype=bool)
     else:
         settings = LatticeParams(beta=beta, dimt=Nt, dimx=Nx, fMass=fMass, a=aSpacing)
         _, _, acceptHistory, tunnelAcceptance = hmc.hmcChain(settings, metroSteps, numSubSteps,
                                                              cgRtolForce, cgRtolAction,
-                                                             tunneling, seed, tqdmPosition)
+                                                             tunneling, seed, tqdmPosition,
+                                                             coldStartForce=coldStartForce)
 
     start = int(metroSteps * measureFrom)
     return acceptHistory[start:].mean(), tunnelAcceptance[start:].mean()
@@ -123,7 +135,7 @@ def runExperiment(path, beta=10, fMass=1, aSpacing=1, Nx=4,Nt=4, metroSteps=100,
                    cores=None, chains=10, perChainBurnIn=0,
                    cgRtolForce=1e-5, cgRtolAction=1e-10,
                    fermionAction="wilson", dim5=None, M5=None,
-                   randSeed=0, overwrite=False):
+                   randSeed=0, overwrite=False, coldStartForce=False):
     """
     Runs `chains` independent HMC chains in parallel, drops each chain's burn-in,
     merges the thermalized configs and writes them to `path` with saveEnsemble.
@@ -160,7 +172,8 @@ def runExperiment(path, beta=10, fMass=1, aSpacing=1, Nx=4,Nt=4, metroSteps=100,
 
         results = Parallel(n_jobs=cores)(
             delayed(hmc_dwf.hmcChain)(settings, perChainBurnIn + stepsPerChain, numSubSteps,
-                                      cgRtolForce, cgRtolAction, seeds[i], i)
+                                      cgRtolForce, cgRtolAction, seeds[i], i,
+                                      coldStartForce=coldStartForce)
             for i in range(chains))
 
         tunnelAcceptance = None
@@ -171,7 +184,8 @@ def runExperiment(path, beta=10, fMass=1, aSpacing=1, Nx=4,Nt=4, metroSteps=100,
 
         results = Parallel(n_jobs=cores)(
             delayed(hmc.hmcChain)(settings, perChainBurnIn + stepsPerChain, numSubSteps,
-                                  cgRtolForce, cgRtolAction, tunneling, seeds[i], i)
+                                  cgRtolForce, cgRtolAction, tunneling, seeds[i], i,
+                                  coldStartForce=coldStartForce)
             for i in range(chains))
 
         tunnelAcceptance = np.concatenate([r[3][perChainBurnIn:] for r in results])[:metroSteps]
@@ -184,7 +198,8 @@ def runExperiment(path, beta=10, fMass=1, aSpacing=1, Nx=4,Nt=4, metroSteps=100,
 
     saveEnsemble(path, settings, linkHistory, acceptHistory, tunnelAcceptance,
                  tunneling, cgRtolForce, cgRtolAction, numSubSteps, seeds,
-                 fermionAction=fermionAction, dHHistory=dHHistory, overwrite=overwrite)
+                 fermionAction=fermionAction, dHHistory=dHHistory, overwrite=overwrite,
+                 coldStartForce=coldStartForce)
 
     return path
     

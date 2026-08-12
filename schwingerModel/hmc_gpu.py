@@ -65,6 +65,17 @@ try:
 except Exception:
     _USE_CUDA_KERNEL = False
 
+#5D even/odd Schur preconditioning (see the "Schur" section at the bottom): the
+#pseudofermion action lives on the odd checkerboard and every solve runs on the
+#Schur complement S. On by default; SCHWINGER_NO_SCHUR=1 restores the
+#unpreconditioned path for A/B comparisons. Either setting works with or
+#without the CUDA kernel (there is an XLA fallback for the half-lattice apply).
+#NOTE the force must be the single Hermitian solve (S S^dag)^-1 phi_o: an
+#earlier variant that kept the unpreconditioned action and chained two
+#nonsymmetric Schur solves for (D D^dag)^-1 hit a c64 rounding floor amplified
+#by kappa(D) (~3% force error, zero acceptance at m=0.01 Nx=64).
+_SCHUR_DEFAULT = os.environ.get("SCHWINGER_NO_SCHUR") != "1"
+
 #spin matrices as jax constants (same convention as params.py)
 _GAMMA_X = jnp.array([[0, 1], [1, 0]], dtype=jnp.complex128)
 _GAMMA_T = jnp.array([[0, -1j], [1j, 0]], dtype=jnp.complex128)
@@ -73,8 +84,19 @@ _GAMMA_5 = jnp.array([[1, 0], [0, -1]], dtype=jnp.complex128)
 
 #settings is static: shapes depend on it, and dwfParams is hashable so the jit
 #cache keys on it (a different fMass or lattice size compiles its own version)
-@partial(jax.jit, static_argnums=0)
-def pseudoBilinear(settings, pseudoField, gaugeLinks, cgRtol):
+@partial(jax.jit, static_argnums=(0, 4))
+def pseudoBilinear(settings, pseudoField, gaugeLinks, cgRtol, schur=_SCHUR_DEFAULT):
+
+    if schur:
+        #preconditioned action: pseudoField is the packed odd-site phi_o and the
+        #action is phi_o^dag (S S^dag)^-1 phi_o. Same variational CG structure
+        #as the unpreconditioned normal equations (the bilinear is quadratically
+        #accurate in the residual), just on the smaller, better-conditioned S.
+        A = lambda v: applySchur(settings, gaugeLinks,
+                                 applySchur(settings, gaugeLinks, v, -1), +1)
+        X, _ = cg(A, pseudoField, tol=cgRtol)
+        relRes = jnp.linalg.norm(A(X) - pseudoField) / jnp.linalg.norm(pseudoField)
+        return jnp.vdot(pseudoField, X).real, relRes
 
     operator = lambda v: applyD_dwf(settings, gaugeLinks, applyDdag_dwf(settings, gaugeLinks, v))
 
@@ -145,19 +167,34 @@ def pvForce(settings: dwfParams, gaugeLinks, chi):
     return fermionForceBilinear(settings, gaugeLinks, W, chi)
 
 
-@partial(jax.jit, static_argnums=0)
-def hmcForcingFunction_vec(settings: dwfParams, gaugeLinks, phis, chi, x0=None, cgRtol=1e-5):
+@partial(jax.jit, static_argnums=(0, 6))
+def hmcForcingFunction_vec(settings: dwfParams, gaugeLinks, phis, chi, x0=None, cgRtol=1e-5,
+                           schur=_SCHUR_DEFAULT):
 
     gaugeLinks = gaugeLinks.astype(jnp.complex64)
     phis = phis.astype(jnp.complex64)
     chi = chi.astype(jnp.complex64)
 
-    operator = lambda v: applyD_dwf(settings, gaugeLinks, applyDdag_dwf(settings, gaugeLinks, v))
-    
-    X, _ = cg(operator, phis, tol=cgRtol,x0=x0)
+    if schur:
+        #preconditioned action: phis is the packed odd-site phi_o, and the force
+        #comes from the single Hermitian solve X = (S S^dag)^-1 phi_o. One
+        #variational CG keeps the c64 forward error at the same level as the
+        #unpreconditioned normal equations (chaining two nonsymmetric Schur
+        #solves instead lets c64 rounding amplify through kappa(D): ~30% force
+        #error and zero acceptance at m=0.01 Nx=64).
+        A = lambda v: applySchur(settings, gaugeLinks,
+                                 applySchur(settings, gaugeLinks, v, -1), +1)
+        X, _ = cg(A, phis, tol=cgRtol, x0=x0)
+        Y = applySchur(settings, gaugeLinks, X, -1)
+        warmStart = X
+    else:
+        operator = lambda v: applyD_dwf(settings, gaugeLinks, applyDdag_dwf(settings, gaugeLinks, v))
 
-    #Y = D^\dagger X
-    Y = applyDdag_dwf(settings, gaugeLinks, X)
+        X, _ = cg(operator, phis, tol=cgRtol,x0=x0)
+
+        #Y = D^\dagger X
+        Y = applyDdag_dwf(settings, gaugeLinks, X)
+        warmStart = X
 
     Ux = gaugeLinks[:, :, 1]  # (dimx, dimt)
     Ut = gaugeLinks[:, :, 0]  # (dimx, dimt)
@@ -188,10 +225,13 @@ def hmcForcingFunction_vec(settings: dwfParams, gaugeLinks, phis, chi, x0=None, 
     # --- Fermion force: -2*Re<X| dD |Y>, minus sign from differentiating the inverse ---
     Force = jnp.stack([guageTimeForce, gaugeSpaceForce], axis=-1)
     
-    Force -= fermionForceBilinear(settings, gaugeLinks, X, Y)
+    if schur:
+        Force += schurFermionForce(settings, gaugeLinks, X, Y)
+    else:
+        Force -= fermionForceBilinear(settings, gaugeLinks, X, Y)
     Force += pvForce(settings, gaugeLinks, chi)
 
-    return Force.astype(jnp.float64), X
+    return Force.astype(jnp.float64), warmStart
 
 @partial(jax.jit, static_argnums=0)
 def pvAction(modelSettings: dwfParams, chi_pv, gaugeLinks):
@@ -221,8 +261,14 @@ def totalAction(modelSettings: dwfParams, gaugeLinks):
     
     return action
 
-@partial(jax.jit, static_argnums=(0, 3))
-def hmcStep(settings:dwfParams, gaugeLinks, rngKey,  numSubSteps=100, cgRtolForce=1e-5,cgRtolAction=1e-10):
+#coldStartForce=True restarts every force CG from zero instead of the previous
+#solution. The force is then a deterministic function of the gauge field alone,
+#the leapfrog map is exactly reversible, and <exp(-dH)> = 1 holds exactly;
+#warm starts violate it measurably (0.916/0.969 unprec/schur at m=0.01 Nx=64)
+#at ~40% less solve time. The bias is not corrected by the Metropolis step.
+@partial(jax.jit, static_argnums=(0, 3, 6, 7))
+def hmcStep(settings:dwfParams, gaugeLinks, rngKey,  numSubSteps=100, cgRtolForce=1e-5,cgRtolAction=1e-10,
+            schur=_SCHUR_DEFAULT, coldStartForce=False):
     kChi, kEta, kMom, kMetro = jax.random.split(rngKey, 4)
 
     shape = (settings.dim5, settings.dimx, settings.dimt, 2)
@@ -231,34 +277,51 @@ def hmcStep(settings:dwfParams, gaugeLinks, rngKey,  numSubSteps=100, cgRtolForc
     conjPInitial = jax.random.normal(kMom, (settings.dimx, settings.dimt, 2))
     r = jax.random.uniform(kMetro)
 
-    #initial fermion action is just \chi.\chi
-    initialFermionAction = jnp.vdot(chi,chi).real
-
     #copy current gauge configuration
     gaugeLinksCopy = jnp.copy(gaugeLinks)
 
     epsilon=1/numSubSteps
 
-    #generate pseduofermions field:
-    phi = applyD_dwf(settings,gaugeLinks,chi)
+    #generate pseduofermions field. In schur mode the pseudofermions live on the
+    #odd checkerboard only: phi_o = S chi_o gives the action
+    #phi_o^dag (S S^dag)^-1 phi_o = chi_o^dag chi_o, and det(S S^dag) equals
+    #det(D D^dag) up to the gauge-independent constant det(c I)^2, so the
+    #sampled ensemble is identical.
+    if schur:
+        chi = packParity(settings, chi, 1)
+        phi = applySchur(settings, gaugeLinks, chi, +1)
+    else:
+        phi = applyD_dwf(settings,gaugeLinks,chi)
+
+    #initial fermion action is just \chi.\chi
+    initialFermionAction = jnp.vdot(chi,chi).real
 
     #generate pseduofermions field for pauli villars:
     pvSettings = settings._replace(fMass=1.0)
-    DDdag_pv = lambda v: applyD_dwf(pvSettings, gaugeLinks, applyDdag_dwf(pvSettings, gaugeLinks, v))
-    y, _ = cg(DDdag_pv, eta, tol=cgRtolAction)
-    resPV = jnp.linalg.norm(DDdag_pv(y) - eta) / jnp.linalg.norm(eta)
+    if schur:
+        #chi_pv = D_pv^dag (D_pv D_pv^dag)^-1 eta = D_pv^-1 eta: one Schur solve
+        chi_pv, _ = schurSolve(pvSettings, gaugeLinks, eta, +1, cgRtolAction)
+        resPV = (jnp.linalg.norm(applyD_dwf(pvSettings, gaugeLinks, chi_pv) - eta)
+                 / jnp.linalg.norm(eta))
+    else:
+        DDdag_pv = lambda v: applyD_dwf(pvSettings, gaugeLinks, applyDdag_dwf(pvSettings, gaugeLinks, v))
+        y, _ = cg(DDdag_pv, eta, tol=cgRtolAction)
+        resPV = jnp.linalg.norm(DDdag_pv(y) - eta) / jnp.linalg.norm(eta)
 
-    chi_pv = applyDdag_dwf(pvSettings, gaugeLinks, y)
+        chi_pv = applyDdag_dwf(pvSettings, gaugeLinks, y)
 
     #first momentum half step:
-    Force, X = hmcForcingFunction_vec(settings, gaugeLinksCopy,phi,chi_pv,cgRtol=cgRtolForce)
+    Force, X = hmcForcingFunction_vec(settings, gaugeLinksCopy,phi,chi_pv,cgRtol=cgRtolForce,
+                                      schur=schur)
     conjP = conjPInitial - epsilon/2 * Force
 
     #full leapfrog steps as one compiled loop: carry = (links, momentum, CG warm start)
     def leapfrogBody(carry, _):
         U, P, Xprev = carry
         U = U * jnp.exp(1j*epsilon*P)
-        F, Xnew = hmcForcingFunction_vec(settings, U, phi, chi_pv, x0=Xprev, cgRtol=cgRtolForce)
+        F, Xnew = hmcForcingFunction_vec(settings, U, phi, chi_pv,
+                                         x0=None if coldStartForce else Xprev,
+                                         cgRtol=cgRtolForce, schur=schur)
         return (U, P - epsilon*F, Xnew), None
 
     (gaugeLinksCopy, conjP, X), _ = jax.lax.scan(leapfrogBody,
@@ -267,10 +330,13 @@ def hmcStep(settings:dwfParams, gaugeLinks, rngKey,  numSubSteps=100, cgRtolForc
 
     #last step
     gaugeLinksCopy *= jnp.exp(1j*epsilon *conjP)
-    Force, X = hmcForcingFunction_vec(settings,gaugeLinksCopy,phi,chi_pv, x0=X,cgRtol=cgRtolForce)
+    Force, X = hmcForcingFunction_vec(settings,gaugeLinksCopy,phi,chi_pv,
+                                      x0=None if coldStartForce else X,cgRtol=cgRtolForce,
+                                      schur=schur)
     conjP = conjP - epsilon/2 * Force
 
-    finalFermionAction, resFinal = pseudoBilinear(settings, phi,gaugeLinksCopy,cgRtolAction)
+    finalFermionAction, resFinal = pseudoBilinear(settings, phi,gaugeLinksCopy,cgRtolAction,
+                                                  schur=schur)
 
     metroFactor = jnp.exp(0.5*jnp.sum(conjPInitial**2)-0.5*jnp.sum(conjP**2)
                             +totalAction(settings, gaugeLinks)-totalAction(settings, gaugeLinksCopy)
@@ -292,7 +358,7 @@ def hmcStep(settings:dwfParams, gaugeLinks, rngKey,  numSubSteps=100, cgRtolForc
 
 def hmcChain(modelSettings:dwfParams, metroSteps=1000, numSubSteps = 10,
               cgRtolForce=1e-5, cgRtolAction=1e-10,
-              seed=0, tqdmPosition=0):
+              seed=0, tqdmPosition=0, schur=_SCHUR_DEFAULT, coldStartForce=False):
 
     chainKey = jax.random.key(seed)
 
@@ -310,7 +376,8 @@ def hmcChain(modelSettings:dwfParams, metroSteps=1000, numSubSteps = 10,
 
         gaugeLinks, acceptHistory[currentStep], _, worstRes = hmcStep(modelSettings, gaugeLinks,stepKey,
                                                           numSubSteps=numSubSteps,
-                                                          cgRtolForce=cgRtolForce,cgRtolAction=cgRtolAction)
+                                                          cgRtolForce=cgRtolForce,cgRtolAction=cgRtolAction,
+                                                          schur=schur, coldStartForce=coldStartForce)
 
         if float(worstRes) > 10 * cgRtolAction:
             raise RuntimeError(f"action/heat-bath CG failed: residual {float(worstRes):.3e}")
@@ -322,13 +389,15 @@ def hmcChain(modelSettings:dwfParams, metroSteps=1000, numSubSteps = 10,
 
 #chains live on axis 0 of gaugeLinks and rngKeys; settings/substeps/tolerances are
 #shared. in_axes pairs with positional args only, so call this positionally:
-#hmcStepBatch(settings, gaugeLinks, chainKeys, numSubSteps, cgRtolForce, cgRtolAction)
-hmcStepBatch = partial(jax.jit, static_argnums=(0, 3))(
-    jax.vmap(hmcStep, in_axes=(None, 0, 0, None, None, None)))
+#hmcStepBatch(settings, gaugeLinks, chainKeys, numSubSteps, cgRtolForce, cgRtolAction,
+#             schur, coldStartForce)
+hmcStepBatch = partial(jax.jit, static_argnums=(0, 3, 6, 7))(
+    jax.vmap(hmcStep, in_axes=(None, 0, 0, None, None, None, None, None)))
 
 
 def hmcChainBatch(modelSettings: dwfParams, nChains, metroSteps=1000, numSubSteps=10,
-                  cgRtolForce=1e-5, cgRtolAction=1e-10, seed=0, tqdmPosition=0):
+                  cgRtolForce=1e-5, cgRtolAction=1e-10, seed=0, tqdmPosition=0,
+                  schur=_SCHUR_DEFAULT, coldStartForce=False):
     """Runs nChains chains in lockstep on the device via hmcStepBatch.
 
     Chain c's randomness at step n is deterministic in (seed, n, c), so a single
@@ -349,7 +418,8 @@ def hmcChainBatch(modelSettings: dwfParams, nChains, metroSteps=1000, numSubStep
         chainKeys = jax.random.split(jax.random.fold_in(masterKey, currentStep), nChains)
 
         gaugeLinks, accept, _, worstRes = hmcStepBatch(modelSettings, gaugeLinks, chainKeys,
-                                                       numSubSteps, cgRtolForce, cgRtolAction)
+                                                       numSubSteps, cgRtolForce, cgRtolAction,
+                                                       schur, coldStartForce)
 
         worst = float(jnp.max(worstRes))
         if worst > 10 * cgRtolAction:
@@ -434,6 +504,131 @@ def applyD_dwf(settings: dwfParams, gaugeLinks, psi):
 def applyDdag_dwf(settings: dwfParams, gaugeLinks, psi):
     """Matrix-free D_dwf^dagger, equivalent to buildDwfOp(...).conj().T @ psi.flatten()."""
     return _applyD_core(settings, gaugeLinks, psi, -1)
+
+
+# --- 5D even/odd Schur preconditioning ---------------------------------------
+#
+#Sites are checkerboarded on the 5D parity (s + x + t) % 2. Every term of D_dwf
+#that couples sites moves exactly one of (s, x, t) by one step (the wraps too,
+#when all three extents are even), so all coupling is between opposite parities
+#and the same-parity blocks are the constant diagonal c = 1 - M5 + 2/a:
+#
+#    D = [ c*I   D_eo ]        Schur complement (odd sites):
+#        [ D_oe  c*I  ]        S = c*I - (1/c) D_oe D_eo
+#
+#Solving D x = b then reduces to a half-size, better-conditioned solve
+#S x_o = b_o - (1/c) D_oe b_e followed by the trivial back-substitution
+#x_e = (b_e - D_eo x_o) / c. Because c is gauge-independent, det(D) equals
+#det(S) up to a constant, and none of the actions or forces change - only the
+#solver does.
+#
+#Packed fields have shape (dim5, dimx, dimt/2, 2): packed[s, x, h] holds the
+#site at physical t = 2h + r with r = (s + x + parity) % 2, so a full field
+#viewed as (dim5, dimx, dimt/2, r, 2) is a parity gather/scatter along r.
+
+
+def _schurDiag(settings: dwfParams):
+    return 1.0 - settings.M5 + 2.0 / settings.a
+
+
+def _parityIdx(settings: dwfParams, parity):
+    """(dim5, dimx, 1, 1, 1) int array of r = (s + x + parity) % 2."""
+    s = np.arange(settings.dim5)[:, None]
+    x = np.arange(settings.dimx)[None, :]
+    return jnp.asarray((s + x + parity) % 2)[:, :, None, None, None]
+
+
+def packParity(settings: dwfParams, psi, parity):
+    """Gathers the parity-`parity` sites of psi into a packed (S, X, T/2, 2) field."""
+    S, X, T = settings.dim5, settings.dimx, settings.dimt
+    v = psi.reshape(S, X, T // 2, 2, 2)          # t split into (h, r)
+    return jnp.take_along_axis(v, _parityIdx(settings, parity), axis=3)[:, :, :, 0, :]
+
+
+def unpackParities(settings: dwfParams, even, odd):
+    """Interleaves packed even- and odd-parity fields back into a full field."""
+    S, X, T = settings.dim5, settings.dimx, settings.dimt
+    stacked = jnp.stack([even, odd], axis=3)     # (S, X, T/2, parity, 2)
+    #site at offset r has parity (s + x + r) % 2, so the r axis is the parity
+    #axis permuted by the same index map the pack uses
+    idx = (_parityIdx(settings, 0) + np.arange(2)[None, None, None, :, None]) % 2
+    return jnp.take_along_axis(stacked, idx, axis=3).reshape(S, X, T, 2)
+
+
+def _applyHalf(settings: dwfParams, gaugeLinks, psi, sign, parityOut):
+    """Hopping block D_{p,1-p}: packed parity-(1-p) field in, packed parity-p out.
+
+    The diagonal c is excluded (it is the same-parity block). CUDA kernel when
+    built; otherwise scatter -> full apply -> gather, which is correct because
+    the diagonal of the full apply only touches the parity the gather drops.
+    """
+    if _USE_CUDA_KERNEL:
+        return _dwf_cuda.applyHalf(settings, gaugeLinks, psi, sign, parityOut)
+    zeros = jnp.zeros_like(psi)
+    full = (unpackParities(settings, psi, zeros) if parityOut == 1
+            else unpackParities(settings, zeros, psi))
+    return packParity(settings, _applyD_xla(settings, gaugeLinks, full, sign), parityOut)
+
+
+def applySchur(settings: dwfParams, gaugeLinks, vOdd, sign):
+    """S v (sign=+1) or S^dag v (sign=-1) on packed odd-parity fields.
+
+    S^dag is S built from D^dag because the adjoint of a block is the block of
+    the adjoint: (D_oe D_eo)^dag = (D^dag)_oe (D^dag)_eo.
+    """
+    c = _schurDiag(settings)
+    e = _applyHalf(settings, gaugeLinks, vOdd, sign, 0)
+    return c * vOdd - _applyHalf(settings, gaugeLinks, e, sign, 1) / c
+
+
+def schurFermionForce(settings: dwfParams, gaugeLinks, X, Y):
+    """dS_f/dtheta for the preconditioned action S_f = phi_o^dag (S S^dag)^-1 phi_o.
+
+    X = (S S^dag)^-1 phi_o and Y = S^dag X, both packed odd fields. With
+    dS = -(1/c)(dD_oe D_eo + D_oe dD_eo) the chain rule gives
+    dS_f = -2 Re<X| dS |Y> = +(1/c)[2Re<X| dD |D_eo Y> + 2Re<(D_oe^dag X)| dD |Y>],
+    and each bracket is the existing fermionForceBilinear evaluated on fields
+    scattered back to the full lattice (dD is pure hopping, so the odd/even
+    supports pick out exactly the dD_oe / dD_eo blocks).
+    Note the sign: this returns +dS_f/dtheta, where the unpreconditioned path's
+    -fermionForceBilinear(X, Y) is its dS_f/dtheta.
+    """
+    c = _schurDiag(settings)
+    W = _applyHalf(settings, gaugeLinks, Y, +1, 0)   # D_eo Y        (even field)
+    Z = _applyHalf(settings, gaugeLinks, X, -1, 0)   # D_oe^dag X    (even field)
+    zeros = jnp.zeros_like(X)
+    Xf = unpackParities(settings, zeros, X)
+    Yf = unpackParities(settings, zeros, Y)
+    Wf = unpackParities(settings, W, zeros)
+    Zf = unpackParities(settings, Z, zeros)
+    return (fermionForceBilinear(settings, gaugeLinks, Xf, Wf)
+            + fermionForceBilinear(settings, gaugeLinks, Zf, Yf)) / c
+
+
+def schurSolve(settings: dwfParams, gaugeLinks, b, sign, tol, x0Odd=None):
+    """Solves D x = b (sign=+1) or D^dag x = b (sign=-1) via the Schur complement.
+
+    S is not Hermitian, so the odd-site system is solved by CG on the normal
+    equations S^dag S x_o = S^dag rhs (cost per iteration ~ one D and one
+    D^dag apply, same as the unpreconditioned normal equations, but on a
+    system with ~1/4 the condition number).
+    Returns (x, x_o): the full solution and the packed odd half for warm starts.
+    """
+    assert settings.dim5 % 2 == 0 and settings.dimx % 2 == 0 and settings.dimt % 2 == 0, \
+        "5D even/odd preconditioning needs even dim5, dimx and dimt"
+    assert _schurDiag(settings) != 0.0
+
+    c = _schurDiag(settings)
+    bE = packParity(settings, b, 0)
+    bO = packParity(settings, b, 1)
+    rhs = bO - _applyHalf(settings, gaugeLinks, bE, sign, 1) / c
+
+    A = lambda v: applySchur(settings, gaugeLinks,
+                             applySchur(settings, gaugeLinks, v, sign), -sign)
+    xO, _ = cg(A, applySchur(settings, gaugeLinks, rhs, -sign), x0=x0Odd, tol=tol)
+
+    xE = (bE - _applyHalf(settings, gaugeLinks, xO, sign, 0)) / c
+    return unpackParities(settings, xE, xO), xO
 
 
 
