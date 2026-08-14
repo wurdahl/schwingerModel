@@ -309,8 +309,11 @@ def generateDistillFile(ensemblePath, filePath, numVecs,
 
     v2 files do NOT store the gauge links: everything a measurement needs is
     precomputed here, so the momks/DNums given must cover every operator you
-    intend to measure — there is no rebuild path afterwards. Q is stored per
-    config so theta-reweighting works without the ensemble.
+    intend to measure. Missing elementals CAN be added later with
+    backfillElementals (cheap: it reuses the stored eigVecs and reads links
+    from the source ensemble) — it is the perambulator/eigVecs that have no
+    rebuild path. Q is stored per config so theta-reweighting works without
+    the ensemble.
 
     Reruns are incremental: existing config groups are skipped, so you can extend the
     ensemble coverage — but NOT add datasets to existing groups.
@@ -361,6 +364,88 @@ def generateDistillFile(ensemblePath, filePath, numVecs,
     return filePath
 
 
+def _backfillConfig(modelSettings, gaugeLinks, eigVecs, missing):
+    """Spatial elementals for one config's missing (momk, DNum) keys."""
+    return {f"elem/p{k}_d{n}":
+            buildElementalSpatial(modelSettings, gaugeLinks, eigVecs, DNum=n, momk=k)
+            for k, n in missing}
+
+
+def backfillElementals(filePath, momks=(0,), DNums=(0,), ensemblePath=None, n_jobs=-1):
+    """
+    Add spatial elementals for new (momk, DNum) keys to an existing cache.
+
+    The expensive per-config data (eigVecs, perambulator) does not depend on
+    momks/DNums, so a cache's operator coverage can be widened after the fact
+    at almost no cost: the stored eigVecs are reused and only
+    buildElementalSpatial runs — no eigensolves, no Dirac solves. The gauge
+    links (which v2 caches drop, and which only the DNum > 0 derivatives need)
+    are read from the source ensemble, one config at a time.
+
+    Idempotent and incremental: every (momk, DNum) pair of the two lists is
+    ensured, keys a group already has are skipped, and a rerun is a no-op.
+    Works on caches from either generator (cpu or gpu — both store the same
+    layout). Order of operations when also extending config coverage: run
+    generateDistillFile first (new groups get the keys IT was given), then
+    backfill, so the new groups are seen here too.
+
+    Args:
+        filePath: distill cache to extend, opened read/write.
+        momks: momentum keys to ensure, as in generateDistillFile.
+        DNums: covariant-derivative counts to ensure.
+        ensemblePath: gauge ensemble holding the links. Defaults to the
+            cache's own sourceEnsemble attr; pass explicitly if the ensemble
+            file has moved since generation.
+        n_jobs: joblib workers (workers compute, this thread writes).
+
+    Returns:
+        filePath, for chaining.
+
+    Raises:
+        ValueError: If the ensemble's physics attrs disagree with the cache's
+            (wrong ensemble for this cache), or a config group predates stored
+            eigVecs (v1 cache — regenerate instead).
+    """
+    wanted = [(int(k), int(n)) for k in momks for n in DNums]
+    with h5py.File(filePath, "r+") as f:
+        if ensemblePath is None:
+            ensemblePath = f.attrs["sourceEnsemble"]
+        with h5py.File(ensemblePath, "r") as ens:
+            modelSettings = _paramsFromAttrs(ens.attrs)
+            #sourceEnsemble is provenance, not part of the consistency check —
+            #so before mixing this ensemble's links with the cache's eigVecs,
+            #verify they really are the same physics
+            for key in ("dimx", "dimt", "a", "fMass", "beta"):
+                if not np.all(f.attrs[key] == getattr(modelSettings, key)):
+                    raise ValueError(f"{ensemblePath} has {key}={getattr(modelSettings, key)}, "
+                                     f"cache was generated with {key}={f.attrs[key]}; "
+                                     f"wrong ensemble for this cache")
+            links = ens["links"]
+
+            todo = []
+            for name in sorted(k for k in f if k.startswith("cfg")):
+                missing = [(k, n) for k, n in wanted if f"elem/p{k}_d{n}" not in f[name]]
+                if missing:
+                    if "eigVecs" not in f[name]:
+                        raise ValueError(f"{filePath}:{name} has no stored eigVecs "
+                                         f"(v1 cache); regenerate it instead")
+                    todo.append((name, int(name[3:]), missing))
+            if not todo:
+                return filePath
+
+            #same single-writer pattern as generateDistillFile: links and
+            #eigVecs are read here at dispatch, workers only compute
+            gen = Parallel(n_jobs=n_jobs, return_as="generator")(
+                delayed(_backfillConfig)(modelSettings, links[i], f[name]["eigVecs"][:], missing)
+                for name, i, missing in todo)
+            for (name, i, missing), data in zip(
+                    todo, tqdm(gen, total=len(todo), desc="Backfilling elementals")):
+                for key, arr in data.items():
+                    f[name].create_dataset(key, data=arr)
+
+    return filePath
+
+
 def readDistillMeta(filePath):
     """
     File-level metadata and inventory of a generateDistillFile cache, so notebooks
@@ -373,6 +458,12 @@ def readDistillMeta(filePath):
                       (None for v1 files, which predate it)
     """
     with h5py.File(filePath, "r") as f:
+        #the .h5 gauge ensemble and .hdf5 distill cache differ by three
+        #characters, so getting this wrong is easy — fail with a name, not an
+        #AttributeError three lines down
+        if "links" in f:
+            raise ValueError(f"{filePath} is a gauge ensemble, not a distill "
+                             f"cache — pass the .hdf5 file generateDistillFile wrote")
         meta = SimpleNamespace(**{k: f.attrs[k] for k in f.attrs})
         meta.dimx, meta.dimt = int(meta.dimx), int(meta.dimt)
         meta.numVecs = int(meta.numVecs)

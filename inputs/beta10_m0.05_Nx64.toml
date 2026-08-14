@@ -1,0 +1,40 @@
+#beta=10 m=0.05 at Nx=64, 50k configs: a clone of inputs/beta10_m0.05_Nx32.toml
+#with dimx 32 -> 64 and targetConfigs 20000 -> 50000, nothing else changed.
+#
+#targetConfigs is the TOTAL across chains (run_sim divides by nChains: see
+#stepsPerChain = ceil(metroSteps/nChains)), so 50000 over 16 chains is 3125
+#configs per chain on top of the usual 300 burn-in — the same way 20000 meant
+#16 x 1250 in the Nx=32 run.
+#
+#nChains stays 16: that is the convention at Nx>=32 across every scan, and Nx=64
+#already fills the card with 16.
+outputFile = "configs/dwf_beta_10.0_m_0.05_Nx_64_Nt_64_N5_16.h5"
+
+[physics]
+beta = 10.0
+fMass = 0.05
+fermionAction = "dwf"
+dim5 = 16
+M5 = 1.0
+
+[lattice]
+dimx = 64
+dimt = 64
+
+[run]
+targetConfigs = 50000
+burnIn = 300
+nChains = 16
+backend = "gpu"
+randSeed = 0
+
+[substeps]
+#auto-tune: ceiling raised 200 -> 400 for headroom at the larger volume. The
+#beta=10 Nx=32 run tuned to 60, and at m=0.05 the beta=3 series went 48 -> 63
+#from Nx=32 to Nx=64 (a 1.31x bump), so ~79 is the expectation here. The lighter
+#masses jump harder (m=0.0 went 72 -> 125), hence the generous cap: tuning runs
+#before production, but a ceiling abort still wastes the pilot phase.
+targetAcceptance = 0.85
+pilotSteps = 50
+startSubSteps = 30
+maxSubSteps = 400

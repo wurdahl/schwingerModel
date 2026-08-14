@@ -1,0 +1,38 @@
+#beta=10 counterpart of the beta=3 m=0.05 Nx=32 Nt=64 run: a straight clone of
+#inputs/scan_Nx/dwf_Nx32.toml with beta 3.0 -> 10.0 and nothing else changed, so
+#the two differ only in the gauge coupling.
+#
+#coldStartForce is deliberately absent (defaults false), matching the beta=3 run
+#this is being compared against; the m=0 scan turned it on but that postdates
+#the reference. Note the solver underneath has since changed to the Schur HMC,
+#so the two runs are not bit-comparable regardless.
+outputFile = "configs/dwf_beta_10.0_m_0.05_Nx_32_Nt_64_N5_16.h5"
+
+[physics]
+beta = 10.0
+fMass = 0.05
+fermionAction = "dwf"
+dim5 = 16
+M5 = 1.0
+
+[lattice]
+dimx = 32
+dimt = 64
+
+[run]
+targetConfigs = 20000
+burnIn = 300
+nChains = 16
+backend = "gpu"
+randSeed = 0
+
+[substeps]
+#auto-tune per volume: the light mass and changing volume both move the
+#acceptance, so each Nx finds its own substep count. Ceiling left at the
+#reference run's 200: beta=10 is much weaker coupling than beta=3, so the tuned
+#count should come out well below the 112 that beta=3 needed here. Tuning runs
+#before production, so an over-tight ceiling would fail in minutes, not hours.
+targetAcceptance = 0.85
+pilotSteps = 50
+startSubSteps = 30
+maxSubSteps = 200
