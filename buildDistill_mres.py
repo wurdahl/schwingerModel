@@ -25,7 +25,7 @@ from schwingerModel.distillation_gpu import generateDistillFile
 beta, Nx = 3.0, 32
 numVecs, autocorrSkip = 4, 25
 n5Default = {0.05: (2, 4, 8, 12, 16, 20, 24, 32),
-             0.0: (8, 12, 16, 24, 32)}
+             0.0: (8, 12, 16, 24)}      # 32 unsamplable at m0=0, see scan_N5_m0.0.sh
 
 m = float(sys.argv[1]) if len(sys.argv) > 1 else 0.05
 n5List = [int(a) for a in sys.argv[2:]] or n5Default[m]

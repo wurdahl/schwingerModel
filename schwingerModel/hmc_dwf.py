@@ -11,12 +11,18 @@ def pseudoBilinear(modelSettings: dwfParams, pseudoField, gaugeLinks, cgRtol):
     diracOp = buildDwfOp(modelSettings,gaugeLinks)
     dDag = diracOp.conj().T
 
-    X, exitcode = cg(diracOp @ dDag, pseudoField, rtol= cgRtol)
+    D_pv = buildDwfOp(modelSettings._replace(fMass=1.0), gaugeLinks)
+
+    regulatedField = D_pv@pseudoField
+
+    X, exitcode = cg(diracOp @ dDag, regulatedField, rtol= cgRtol)
 
     if exitcode != 0:
         raise RuntimeError(f"Conjugate Gradient failed to converge! Exit code: {exitcode}")
 
-    return np.vdot(pseudoField,X).real
+    return np.vdot(regulatedField,X).real
+
+
 
 def fermionForceBilinear(settings: dwfParams, gaugeLinks, left, right):
     """2*Re <left| dD/dtheta |right> at each link, summed over the s5 slices.
@@ -66,7 +72,7 @@ def fermionForceBilinear(settings: dwfParams, gaugeLinks, left, right):
     return out
 
 
-def hmcForcingFunction_vec(settings: dwfParams, gaugeLinks, phis, chi, x0=None, cgRtol=1e-5):
+def hmcForcingFunction_vec(settings: dwfParams, gaugeLinks, phis, x0=None, cgRtol=1e-5):
     #force lives on the 2D gauge links: the s5 axis exists only on the fermion fields
     Force = np.zeros((settings.dimx, settings.dimt, 2))
 
@@ -74,8 +80,11 @@ def hmcForcingFunction_vec(settings: dwfParams, gaugeLinks, phis, chi, x0=None, 
     diracOp = buildDwfOp(settings, gaugeLinks)
     dDag = diracOp.conj().T
 
-    #X is (D D^\dagger)^{-1}\phi
-    X, exitcode = cg(diracOp@dDag, phis, x0=x0, rtol=cgRtol)
+    #X is (D D^\dagger)^{-1}D(1)\phi
+
+    D_pv = buildDwfOp(settings._replace(fMass=1.0), gaugeLinks)
+
+    X, exitcode = cg(diracOp@dDag, D_pv@phis, x0=x0, rtol=cgRtol)
 
     if exitcode != 0:
         raise RuntimeError(f"Conjugate Gradient failed to converge! Exit code: {exitcode}")
@@ -114,31 +123,12 @@ def hmcForcingFunction_vec(settings: dwfParams, gaugeLinks, phis, chi, x0=None, 
                     + np.conj(Ut_xp1_tm1) * np.conj(Ux_tm1) * Ut_tm1)
     Force[:, :, 1] = settings.beta * np.imag(Ux * Astaple_x)
 
-    # --- Fermion force: -2*Re<X| dD |Y>, minus sign from differentiating the inverse ---
-    Force -= fermionForceBilinear(settings, gaugeLinks, X, Y)
-    Force += pvForce(settings, gaugeLinks, chi)
+    # Fermion force: 2*Re<X| dD |phis-Y> 
+    phi4 = np.reshape(phis, (settings.dim5, settings.dimx, settings.dimt, 2))
+    Force += fermionForceBilinear(settings, gaugeLinks, X, phi4 - Y)
 
     return Force, Xflat
 
-
-def pvForce(settings: dwfParams, gaugeLinks, chi):
-    """Force from the Pauli-Villars action S_PV = chi^dag D(1)^dag D(1) chi.
-
-    No inverse in the action means no CG solve, and no minus sign:
-    dS_PV = +2*Re<D(1)chi| dD |chi>.
-    """
-    pvOp = buildDwfOp(settings._replace(fMass=1.0), gaugeLinks)
-    W = pvOp @ chi
-
-    W    = np.reshape(W,   (settings.dim5, settings.dimx, settings.dimt, 2))
-    chi4 = np.reshape(chi, (settings.dim5, settings.dimx, settings.dimt, 2))
-
-    return fermionForceBilinear(settings, gaugeLinks, W, chi4)
-
-def pvAction(modelSettings: dwfParams, chi_pv, gaugeLinks):
-    D_pv = buildDwfOp(modelSettings._replace(fMass=1.0), gaugeLinks)
-    v = D_pv @ chi_pv
-    return np.vdot(v, v).real
 
 def hmcStep(modelSettings:dwfParams, gaugeLinks, numSubSteps=100, rng=None,cgRtolForce=1e-5,cgRtolAction=1e-10,
             coldStartForce=False):
@@ -156,50 +146,43 @@ def hmcStep(modelSettings:dwfParams, gaugeLinks, numSubSteps=100, rng=None,cgRto
             +1j*rng.normal(loc=0,scale=1/np.sqrt(2),size=(modelSettings.dim5*modelSettings.dimx*modelSettings.dimt*2)))
 
     #initial fermion action is just \chi.\chi
-    initialFermionAction = np.vdot(chi,chi).real
-
-    # phi = self.apply_D_vectorized(chi,self.gaugeLinks)
-    phi = buildDwfOp(modelSettings,gaugeLinks)@chi
-
-    #generate pseduofermions field:
-    eta = (rng.normal(loc=0,scale=1/np.sqrt(2),size=(modelSettings.dim5*modelSettings.dimx*modelSettings.dimt*2))
-            +1j*rng.normal(loc=0,scale=1/np.sqrt(2),size=(modelSettings.dim5*modelSettings.dimx*modelSettings.dimt*2)))
+    initialFermionAction = np.vdot(chi,chi).real    
 
     pvSettings = modelSettings._replace(fMass=1)
-    #PV heat-bath chi = D^{-1} eta via D^dag (D D^dag)^{-1} eta: the fMass=1
+    #Ratio heat-bath phi = D(1)^{-1} D(m) chi via D(1)^dag (D(1) D(1)^dag)^{-1} D(m) chi,
+    #so that phi^dag D(1)^dag (D(m) D(m)^dag)^{-1} D(1) phi = chi^dag chi. The fMass=1
     #operator is well-conditioned, so CG beats a direct sparse LU by ~100x.
     #Tight rtol because heat-bath error is not corrected by the Metropolis step.
     D_pv = buildDwfOp(pvSettings, gaugeLinks)
     D_pv_dag = D_pv.conj().T
-    y, exitcode = cg(D_pv @ D_pv_dag, eta, rtol=1e-12)
+    y, exitcode = cg(D_pv @ D_pv_dag, buildDwfOp(modelSettings,gaugeLinks)@chi, rtol=1e-12)
     if exitcode != 0:
         raise RuntimeError(f"PV heat-bath CG failed to converge! Exit code: {exitcode}")
-    chi_pv = D_pv_dag @ y
+    phi = D_pv_dag @ y
 
     #generate initial value for conjugate field
     conjPInitial = rng.normal(loc=0,scale=1,size=(modelSettings.dimx,modelSettings.dimt,2))
 
     #first momentum half step:
-    Force, X = hmcForcingFunction_vec(modelSettings, gaugeLinksCopy,phi,chi_pv,cgRtol=cgRtolForce)
+    Force, X = hmcForcingFunction_vec(modelSettings, gaugeLinksCopy,phi,cgRtol=cgRtolForce)
     conjP = conjPInitial - epsilon/2 * Force
     #coldStartForce: restart every force CG from zero so the force is a
     #deterministic function of U and the leapfrog stays exactly reversible
     #(warm starts measurably violate <exp(-dH)>=1); costs ~40% more solve time
     for i in range(numSubSteps-1):
         gaugeLinksCopy *= np.exp(1j*epsilon *conjP)
-        Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,chi_pv,
+        Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,
                                           x0=None if coldStartForce else X,cgRtol=cgRtolForce)
         conjP = conjP - epsilon * Force
     #last step
     gaugeLinksCopy *= np.exp(1j*epsilon *conjP)
-    Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,chi_pv,
+    Force, X = hmcForcingFunction_vec(modelSettings,gaugeLinksCopy,phi,
                                       x0=None if coldStartForce else X,cgRtol=cgRtolForce)
     conjP = conjP - epsilon/2 * Force
 
     metroFactor = np.exp(0.5*np.sum(conjPInitial**2)-0.5*np.sum(conjP**2)
                             +totalAction(modelSettings, gaugeLinks)-totalAction(modelSettings, gaugeLinksCopy)
-                            +initialFermionAction-pseudoBilinear(modelSettings,phi,gaugeLinksCopy,cgRtolAction)
-                            +pvAction(modelSettings, chi_pv,gaugeLinks)-pvAction(modelSettings,chi_pv,gaugeLinksCopy))
+                            +initialFermionAction-pseudoBilinear(modelSettings,phi,gaugeLinksCopy,cgRtolAction))
     r=rng.random()
     if(r<metroFactor):
         success=True
