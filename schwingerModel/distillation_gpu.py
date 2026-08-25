@@ -83,8 +83,10 @@ def _solveColumns(settings, U128, U64, B, cgRtol, innerTol, maxRefine):
 def buildDwfPerambulator(modelSettings: dwfParams, gaugeLinks, eigVecs,
                          cgRtol=1e-10, innerTol=1e-4, colBatch=128, maxRefine=8,
                          progress=False):
-    """GPU version of distillation.buildDwfPerambulator: identical tau, solved
-    as batched CGNE on the device. eigVecs: (dimt, dimx, numVecs)."""
+    """GPU version of distillation.buildDwfPerambulator: identical tau and
+    residual-mass correlators (C_PP, C_JP by dt, distillation source / point
+    sink — see the cpu version for why), solved as batched CGNE on the device.
+    eigVecs: (dimt, dimx, numVecs). Returns (tau, C_PP, C_JP)."""
     N_t, N_x, N_vec = eigVecs.shape
     N5 = modelSettings.dim5
 
@@ -94,6 +96,7 @@ def buildDwfPerambulator(modelSettings: dwfParams, gaugeLinks, eigVecs,
     #flat column list: (t_src, k, s) -> source on the (s==0 ? 0 : N5-1) wall
     cols = [(t, k, s) for t in range(N_t) for k in range(N_vec) for s in range(2)]
     phiSink = np.empty((len(cols), N_x, N_t, 2), dtype=complex)
+    phiMid = np.empty_like(phiSink)
 
     chunks = range(0, len(cols), colBatch)
     for start in (tqdm(chunks) if progress else chunks):
@@ -108,23 +111,38 @@ def buildDwfPerambulator(modelSettings: dwfParams, gaugeLinks, eigVecs,
         #sink walls: spin 0 reads wall N5-1, spin 1 reads wall 0
         phiSink[start:start + len(chunk), :, :, 0] = Phi5[:, N5 - 1, :, :, 0]
         phiSink[start:start + len(chunk), :, :, 1] = Phi5[:, 0, :, :, 1]
+        #midpoint field q_mid = P_- psi(N5/2) + P_+ psi(N5/2-1): same routing,
+        #shifted to the two central slices
+        phiMid[start:start + len(chunk), :, :, 0] = Phi5[:, N5 // 2 - 1, :, :, 0]
+        phiMid[start:start + len(chunk), :, :, 1] = Phi5[:, N5 // 2, :, :, 1]
 
     #reassemble (col, x, t_sink, spin) -> (t_src: x, t_sink, s_sink, k, s_src)
     tau = np.zeros((N_t, N_t, N_vec, 2, N_vec, 2), dtype=complex)
+    C_PP = np.zeros(N_t)
+    C_JP = np.zeros(N_t)
     phiSink = phiSink.reshape(N_t, N_vec, 2, N_x, N_t, 2)  # (t_src, k, s_src, x, t_sink, s_sink)
+    phiMid = phiMid.reshape(N_t, N_vec, 2, N_x, N_t, 2)
     for t_src in range(N_t):
         Phi = phiSink[t_src].transpose(2, 3, 4, 0, 1)      # (x, t_sink, s_sink, k, s_src)
+        PhiMid = phiMid[t_src].transpose(2, 3, 4, 0, 1)
         tau[:, t_src] = np.einsum('tai, atjkd -> tijkd', eigVecs.conj(), Phi, optimize=True)
 
-    return tau
+        #<P P> = sum |G|^2, <J5q P> = Re Tr[G_mid G^dag]; point sink summed over
+        #x and the source/sink spins, rolled so the index is dt = t_sink - t_src
+        cPP = np.sum(np.abs(Phi) ** 2, axis=(0, 2, 3, 4))
+        cJP = np.real(np.sum(PhiMid * Phi.conj(), axis=(0, 2, 3, 4)))
+        C_PP += np.roll(cPP, -t_src)
+        C_JP += np.roll(cJP, -t_src)
+
+    return tau, C_PP / N_t, C_JP / N_t
 
 
 def _generateConfig(modelSettings, gaugeLinks, numVecs, momks, DNums, cgRtol):
     """Per-config data, mirroring distillation._generateConfig: eigVecs and
     elementals on the host, the perambulator on the device."""
     eigVecs = findPartialEigenBasis(modelSettings, gaugeLinks, numVecs)
-    data = {"eigVecs": eigVecs,
-            "peram": buildDwfPerambulator(modelSettings, gaugeLinks, eigVecs, cgRtol=cgRtol)}
+    tau, C_PP, C_JP = buildDwfPerambulator(modelSettings, gaugeLinks, eigVecs, cgRtol=cgRtol)
+    data = {"eigVecs": eigVecs, "peram": tau, "mres/C_PP": C_PP, "mres/C_JP": C_JP}
     for k in momks:
         for n in DNums:
             S = buildElementalSpatial(modelSettings, gaugeLinks, eigVecs, DNum=n, momk=k)

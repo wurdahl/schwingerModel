@@ -3,6 +3,7 @@ from . import analysis
 from . import buildOps
 from . import distillation
 from . import GEVP
+from . import mRes
 from . import interpolator
 from . import wick
 from . import evaluator

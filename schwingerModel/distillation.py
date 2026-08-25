@@ -135,6 +135,14 @@ def buildDwfPerambulator(modelSettings: dwfParams, gaugeLinks, eigVecs, cgRtol=1
 
     tau = np.zeros((N_t, N_t, N_vec, 2, N_vec, 2), dtype=complex)
 
+    #residual-mass correlators, indexed by dt = t_sink - t_src (mod N_t) and
+    #averaged over t_src. Distillation SOURCE, POINT sink summed over x: the
+    #axial Ward identity  D_mu A_mu = 2m P + 2 J5q  is pointwise in the local
+    #densities P(x), J5q(x), so <J5q(t) O>/<P(t) O> -> m_res for any source O
+    #but only if the sink is the local density, not the V V^dag-projected bilinear.
+    C_PP = np.zeros(N_t)
+    C_JP = np.zeros(N_t)
+
     for t_src in range(N_t):
         # Build sources: one column per (k, s), localized at t_src on the source wall
         B = np.zeros((N5*N2, N_vec*2), dtype=complex)
@@ -152,7 +160,21 @@ def buildDwfPerambulator(modelSettings: dwfParams, gaugeLinks, eigVecs, cgRtol=1
         # einsum: t=t_sink, a=x (contracted), i=l_sink, j=s_sink, k=k_src, d=s_src
         tau[:, t_src] = np.einsum('tai, atjkd -> tijkd', eigVecs.conj(), Phi, optimize=True)
 
-    return tau
+        #midpoint field  q_mid = P_- psi(N5/2) + P_+ psi(N5/2-1): same spin->wall
+        #routing as the physical sink, shifted to the two central slices
+        PhiMid = np.empty_like(Phi)
+        PhiMid[:, :, 0] = Phi5[N5//2 - 1, :, :, 0]
+        PhiMid[:, :, 1] = Phi5[N5//2, :, :, 1]
+
+        #gamma5-hermiticity: <P P> = Tr[G G^dag] = sum |G|^2, and the mixed one
+        #<J5q P> = Tr[G_mid G^dag] (NOT sum |G_mid|^2, which would be <J5q J5q>).
+        #sum over x, s_sink, k_src, s_src leaves t_sink; roll so index is dt.
+        cPP = np.sum(np.abs(Phi)**2, axis=(0, 2, 3, 4))                        # (N_t,)
+        cJP = np.real(np.sum(PhiMid * Phi.conj(), axis=(0, 2, 3, 4)))
+        C_PP += np.roll(cPP, -t_src)
+        C_JP += np.roll(cJP, -t_src)
+
+    return tau, C_PP / N_t, C_JP / N_t
 
 def buildElementalSpatial(modelSettings: LatticeParams, gaugeLinks, eigVecs, DNum=0, momk=0):
     """
@@ -211,14 +233,16 @@ class DistillWorkspace:
         self.chemicalPot = chemicalPot
         self.eigVecs = findPartialEigenBasis(modelSettings, gaugeLinks, numVecs)
         self._tau, self._elem = None, {}
+        self.mres = None      # (C_PP, C_JP) by dt; DWF only, filled with tau
 
     @property
     def tau(self):
         if self._tau is None:
             #the params type carries the fermion action: dwfParams -> wall propagator
             if isinstance(self.modelSettings, dwfParams):
-                self._tau = buildDwfPerambulator(self.modelSettings, self.gaugeLinks,
-                                                 self.eigVecs)
+                self._tau, C_PP, C_JP = buildDwfPerambulator(self.modelSettings,
+                                                             self.gaugeLinks, self.eigVecs)
+                self.mres = (C_PP, C_JP)
             else:
                 self._tau = buildPerambulator(self.modelSettings, self.gaugeLinks,
                                               self.eigVecs, chemicalPot=self.chemicalPot)
@@ -288,6 +312,8 @@ def _generateConfig(modelSettings, gaugeLinks, i, numVecs, momks, DNums):
     ws = DistillWorkspace(modelSettings, gaugeLinks, numVecs)
     data = {"eigVecs": ws.eigVecs}
     data[f"peram"] = ws.tau
+    if ws.mres is not None:
+        data["mres/C_PP"], data["mres/C_JP"] = ws.mres
     for k in momks:
         for n in DNums:
             data[f"elem/p{k}_d{n}"] = ws.elemental(MesonOp("g5", n, k))  # gamma irrelevant, spatial stored
@@ -481,3 +507,29 @@ def readDistillMeta(filePath):
         else:
             meta.Q = None
     return meta
+
+
+def readMres(filePath):
+    """
+    Per-config residual-mass correlators from a dwf distill cache, for
+    <C_JP>/<C_PP> -> m_res. Ordered like readDistillMeta(filePath).configIndices,
+    so its Q lines up for reweighting.
+
+    Returns:
+        C_PP: (nCfg, dimt) point-sink <P(dt) P(0)>, source-averaged
+        C_JP: (nCfg, dimt) point-sink <J5q(dt) P(0)>, same normalization
+    Raises KeyError for caches generated before the mres datasets existed
+    (2026-08-24): existing groups are skipped on rerun, so those need a
+    regenerated cache, not a backfill.
+    """
+    with h5py.File(filePath, "r") as f:
+        if "links" in f:
+            raise ValueError(f"{filePath} is a gauge ensemble, not a distill "
+                             f"cache — pass the .hdf5 file generateDistillFile wrote")
+        names = sorted(name for name in f if name.startswith("cfg"))
+        if "mres" not in f[names[0]]:
+            raise KeyError(f"{filePath} has no mres/ datasets: it predates the "
+                           f"residual-mass correlators, regenerate it")
+        C_PP = np.array([f[n]["mres/C_PP"][()] for n in names])
+        C_JP = np.array([f[n]["mres/C_JP"][()] for n in names])
+    return C_PP, C_JP
