@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 
 # imported rather than reimplemented: the overlaid curve must be the SAME model
 # massReduce fitted, or the plot quietly misrepresents the fit
-from .GEVP import _backwardFactor, _FIT_SIGNS
+from .GEVP import _twoExpModel, _FIT_SIGNS
 
 
 # ---------------------------------------------------------------------------
@@ -226,22 +226,23 @@ def _window(spec, state):
 
 
 def fitCurve(form="exp", ti=1, shift=0, dimt=None):
-    """Rebuild massReduce's fitted model as f(t, E, logA), for overlaying.
+    """Rebuild massReduce's fitted model as f(t, m, dm, A), for overlaying.
 
-    Pass the SAME form/ti/shift you gave massReduce. With the default "exp" this
-    is just exp(logA - E t); the periodic forms multiply in the around-the-torus
-    image, so the drawn curve turns over where the data does instead of running
-    off the bottom of the plot.
+    Pass the SAME form/ti/shift you gave massReduce. t is absolute time (the
+    index of the GEVP curves). The model is the two-exponential shape of
+    GEVP._twoExpModel, normalised to 1 at ti; the periodic forms multiply in
+    the around-the-torus image, so the drawn curve turns over where the data
+    does instead of running off the bottom of the plot.
 
     Args:
         form: "exp", "cosh", "sinh", or "auto" ("sinh" if shift else "cosh").
-        ti: GEVP reference slice, so actual time is tau = t + ti. Defaults to 1.
+        ti: GEVP reference slice the fit was normalised at. Defaults to 1.
         shift: The shift used to build the curves. Defaults to 0.
         dimt: Full temporal extent T. Required for the periodic forms.
 
     Returns:
-        Callable[[array, float, float], array]: f(t, E, logA), carrying a
-        `.periodic` flag the plot functions use to decide how far to draw it.
+        Callable[[array, float, float, float], array]: f(t, m, dm, A), carrying
+        a `.periodic` flag the plot functions use to decide how far to draw it.
 
     Raises:
         ValueError: On an unknown form, or a periodic form without dimt.
@@ -253,16 +254,15 @@ def fitCurve(form="exp", ti=1, shift=0, dimt=None):
     sign = _FIT_SIGNS[form]
     if sign != 0 and dimt is None:
         raise ValueError(f"dimt is required for the {form!r} form")
-
-    def _model(t, E, logA):
-        t = np.asarray(t, dtype=float)
-        return np.exp(logA - E * t) * _backwardFactor(E, t, ti, dimt, shift, sign)
-
-    _model.periodic = sign != 0
-    return _model
+    return _twoExpModel(ti, dimt, shift, sign)
 
 
-_EXP_MODEL = fitCurve("exp")
+def _checkParams(masses, i):
+    """Raise unless masses[i] central is the (n_states, 3) of withAmp=True."""
+    if np.ndim(masses[i][0]) != 2 or np.shape(masses[i][0])[1] != 3:
+        raise ValueError(f"masses[{i}] central has shape {np.shape(masses[i][0])}; "
+                         "expected (n_states, 3) — rerun with "
+                         "massReduce(..., withAmp=True)")
 
 
 # ---------------------------------------------------------------------------
@@ -270,9 +270,9 @@ _EXP_MODEL = fitCurve("exp")
 # ---------------------------------------------------------------------------
 
 def prinCorrelSemilog(prinCorrels, masses=None, labels=None, states=None,
-                      fitT=None, tmax=None, absolute=True, fitModel=None,
+                      fitT=None, tmax=None, absolute=True, fitModel=None, ti=1,
                       maxCols=4, title=None,
-                      xlabel=r"$(t - t_i)/a$",
+                      xlabel=r"$t/a$",
                       ylabel=None, ylim=None, savePath=None):
     """Raw GEVP eigenvalue curves on a log axis, one panel per ensemble.
 
@@ -292,31 +292,35 @@ def prinCorrelSemilog(prinCorrels, masses=None, labels=None, states=None,
     Args:
         prinCorrels: List of bootstrapEnsemble outputs run with a
             makeGevpReduce reduce: each [central, err, cov] with central
-            (T', n_states) and err (2, T', n_states) rows
-            (high - central, central - low).
+            (T, n_states) and err (2, T, n_states) rows
+            (high - central, central - low), indexed by absolute time.
         masses: Optional list of bootstrapEnsemble outputs from
-            massReduce(..., withAmp=True), aligned with prinCorrels. If given,
-            each state's fitted exponential exp(logA - E t) is drawn through its
-            points, which is what makes a bad fit window obvious. The line spans
+            massReduce(..., withAmp=True), aligned with prinCorrels: each
+            central is (n_states, 3) with columns [m, dm, A]. If given, each
+            state's fitted curve is drawn through its points, which is what
+            makes a bad fit window obvious. For the "exp" form the line spans
             only the pre-crossing region, where a forward exponential applies.
             Defaults to None (data only).
         labels: Per-panel titles, e.g. [r"$m_0 = 0.1$", ...]. Defaults to None.
         states: Which GEVP states to draw, e.g. [0, 1]. Defaults to None (all).
-        fitT: The window(s) given to massReduce. Either one (lo, hi) shared by
-            every panel, a flat list of windows (one per panel when its length
-            matches the panel count, else one per state), or a per-panel list of
-            per-state lists — see _panelWindows. Shades [lo, hi - 1] using the
-            first drawn state's window. Defaults to None (no shading).
+        fitT: The window(s) given to massReduce, in absolute time. Either one
+            (lo, hi) shared by every panel, a flat list of windows (one per panel
+            when its length matches the panel count, else one per state), or a
+            per-panel list of per-state lists — see _panelWindows. Shades
+            [lo, hi - 1] using the first drawn state's window. Defaults to None
+            (no shading).
         tmax: Plot only t < tmax. Defaults to None, which uses the whole curve
             when absolute is True, and otherwise stops shortly after the last
             positive point since a log axis cannot draw the rest.
         absolute: Plot |lambda| rather than lambda. Defaults to True. Set False
             to drop negative points entirely and see only the decaying side.
-        fitModel: f(t, E, logA) rebuilding the model massReduce fitted; build it
-            with fitCurve(form, ti, shift, dimt) using the SAME arguments. The
-            default assumes a plain forward exponential, so pass this whenever
-            massReduce ran with fitForm="cosh"/"sinh" — otherwise the overlaid
-            line is not the curve that was fitted.
+        fitModel: f(t, m, dm, A) rebuilding the model massReduce fitted; build
+            it with fitCurve(form, ti, shift, dimt) using the SAME arguments.
+            The default assumes the "exp" form at this `ti`, so pass this
+            whenever massReduce ran with fitForm="cosh"/"sinh" — otherwise
+            the overlaid line is not the curve that was fitted.
+        ti: GEVP reference slice massReduce used; only needed for the default
+            exponential overlay when fitModel is None. Defaults to 1.
         maxCols: Maximum panels per row. Defaults to 4.
         title: Figure suptitle. Defaults to None.
         xlabel: Time-axis label, on the bottom panel of each column.
@@ -335,15 +339,13 @@ def prinCorrelSemilog(prinCorrels, masses=None, labels=None, states=None,
         if len(masses) != len(prinCorrels):
             raise ValueError(f"prinCorrels has {len(prinCorrels)} entries but masses "
                              f"has {len(masses)}; they must be aligned")
-        for i, m in enumerate(masses):
-            if np.ndim(m[0]) != 2 or np.shape(m[0])[1] != 2:
-                raise ValueError(f"masses[{i}] central has shape {np.shape(m[0])}; "
-                                 "expected (n_states, 2) — rerun with "
-                                 "massReduce(..., withAmp=True)")
+        for i in range(len(masses)):
+            _checkParams(masses, i)
 
     n = len(prinCorrels)
     fig, axes, nRows, nCols = makeGrid(n, maxCols=maxCols)
     specs = _panelWindows(fitT, n)
+    model = fitModel if fitModel is not None else fitCurve("exp", ti=ti)
 
     for i, ax in enumerate(axes):
         central, err = prinCorrels[i][0], prinCorrels[i][1]
@@ -404,9 +406,8 @@ def prinCorrelSemilog(prinCorrels, masses=None, labels=None, states=None,
                 dataHi = max(dataHi, np.nanmax((y + errUp)[good]))
 
             if masses is not None:
-                E, logA = masses[i][0][s]
-                if np.isfinite(E) and np.isfinite(logA):
-                    model = fitModel if fitModel is not None else _EXP_MODEL
+                params = masses[i][0][s]
+                if np.all(np.isfinite(params)):
                     if getattr(model, "periodic", False):
                         tf = t[sel]         # turns over on its own; draw it all
                     else:
@@ -414,7 +415,7 @@ def prinCorrelSemilog(prinCorrels, masses=None, labels=None, states=None,
                         # continuing it would drag the log range down by decades
                         fitSel = (raw > 0) & ~np.maximum.accumulate(neg)
                         tf = t[sel][fitSel] if fitSel.any() else t[sel]
-                    ax.plot(tf, model(tf, E, logA), color=color, lw=LW, zorder=2)
+                    ax.plot(tf, np.abs(model(tf, *params)), color=color, lw=LW, zorder=2)
 
         ax.set_yscale("log")
         # scale to the DATA; late-time bars span decades and would set the range
@@ -449,41 +450,47 @@ def prinCorrelSemilog(prinCorrels, masses=None, labels=None, states=None,
 
 
 def prinCorrelOverFit(prinCorrels, masses, labels=None, state=0, fitT=None,
-                      tmax=None, fitModel=None, maxCols=4, color=JLab_blue,
-                      marker="o", title=None, xlabel=r"$(t - t_i)/a$",
+                      tmax=None, fitModel=None, ti=1, maxCols=4, color=JLab_blue,
+                      marker="o", title=None, xlabel=r"$t/a$",
                       ylabel=None, savePath=None):
-    """Principal correlators divided by their fitted model, one panel each.
+    """Principal correlators divided by the fitted GROUND-STATE term, one panel each.
 
-    Plots lambda^(s)(t) / fit(t), which flattens to 1 wherever the fit
-    describes the data — the deviation from unity is far easier to read than a
-    log-scale correlator, and the panels stay comparable across ensembles even
-    when their masses differ by an order of magnitude.
+    Plots lambda^(s)(t) / ground(t), where ground is the single-state part of
+    the fit with the fitted mass (see GEVP._twoExpModel: (1 - A) g_m / den), and
+    overlays fit / ground = 1 + A/(1-A) g_{m+dm}/g_m, the contamination shape.
+    The data flatten to 1 wherever the ground state dominates, the curve shows
+    where the fit says they should not, and the two agreeing is the fit
+    working. The deviation from unity is far easier to read than a log-scale
+    correlator, and the panels stay comparable across ensembles even when
+    their masses differ by an order of magnitude.
 
     Args:
         prinCorrels: List of bootstrapEnsemble outputs run with a
             makeGevpReduce reduce: each [central, err, cov] with central
-            (T', n_states) and err (2, T', n_states) rows
-            (high - central, central - low).
+            (T, n_states) and err (2, T, n_states) rows
+            (high - central, central - low), indexed by absolute time.
         masses: List of bootstrapEnsemble outputs run with
             massReduce(..., withAmp=True), aligned with prinCorrels: each
-            central is (n_states, 2) with columns [E, logA]. withAmp=True is
-            required — the amplitude is what sets the curve being divided out.
+            central is (n_states, 3) with columns [m, dm, A]. withAmp=True is
+            required — the contamination terms set the curve being divided out.
         labels: Per-panel titles, e.g. [r"$N_x = 4$", ...]. Defaults to None
             (no panel titles).
         state: Which GEVP state to plot, 0 = ground. Defaults to 0.
-        fitT: The window(s) given to massReduce (half-open, in curve-index
-            units). Either one (lo, hi) shared by every panel, a flat list of
+        fitT: The window(s) given to massReduce (half-open, in absolute
+            time). Either one (lo, hi) shared by every panel, a flat list of
             windows (one per panel when its length matches the panel count, else
             one per state), or a per-panel list of per-state lists — see
             _panelWindows. Shades [lo, hi - 1] and focuses the y-range there.
             Defaults to None (no shading, y-range from all plotted points).
         tmax: Plot only t < tmax, to cut the late-time noise tail. Defaults to
             None (whole curve).
-        fitModel: f(t, E, logA) rebuilding the model massReduce fitted; build it
-            with fitCurve(form, ti, shift, dimt) using the SAME arguments. The
-            default divides by a plain forward exponential, so pass this
-            whenever massReduce ran with fitForm="cosh"/"sinh" — otherwise the
-            ratio bakes the periodic image into the deviation from 1.
+        fitModel: f(t, m, dm, A) rebuilding the model massReduce fitted; build
+            it with fitCurve(form, ti, shift, dimt) using the SAME arguments.
+            The default divides by the "exp" form, so pass this whenever
+            massReduce ran with fitForm="cosh"/"sinh" — otherwise the ratio
+            bakes the periodic image into the deviation from 1.
+        ti: GEVP reference slice massReduce used; only needed for the default
+            exponential model when fitModel is None. Defaults to 1.
         maxCols: Maximum panels per row. Defaults to 4.
         color: Marker/errorbar color. Defaults to JLab_blue.
         marker: Marker shape. Defaults to "o".
@@ -491,9 +498,9 @@ def prinCorrelOverFit(prinCorrels, masses, labels=None, state=0, fitT=None,
             want one; strip it for the paper (that goes in the caption).
             Defaults to None.
         xlabel: Time-axis label, drawn on the bottom panel of each column.
-            Defaults to r"$(t - t_i)/a$".
+            Defaults to r"$t/a$".
         ylabel: Left-column label. Defaults to None, which builds
-            lambda^(state)(t) / A e^{-E_state t}.
+            lambda^(state)(t) / ground.
         savePath: If given, savefig here (use a .pdf under figs/). Defaults to
             None.
 
@@ -511,50 +518,52 @@ def prinCorrelOverFit(prinCorrels, masses, labels=None, state=0, fitT=None,
     n = len(prinCorrels)
     fig, axes, nRows, nCols = makeGrid(n, maxCols=maxCols)
     specs = _panelWindows(fitT, n)
+    model = fitModel if fitModel is not None else fitCurve("exp", ti=ti)
 
     for i, ax in enumerate(axes):
         win = _window(specs[i], state)
         central, err = prinCorrels[i][0], prinCorrels[i][1]
         mCentral, mErr = masses[i][0], masses[i][1]
+        _checkParams(masses, i)
 
-        if np.ndim(mCentral) != 2 or np.shape(mCentral)[1] != 2:
-            raise ValueError(f"masses[{i}] central has shape {np.shape(mCentral)}; "
-                             "expected (n_states, 2) — rerun with "
-                             "massReduce(..., withAmp=True)")
-
-        E, logA = mCentral[state]
+        params = mCentral[state]
+        E = params[0]
         dE = np.nanmax(mErr[:, state, 0])            # widest of the two error rows
 
-        t = np.arange(central.shape[0])              # curve-index time, matches the fit
+        t = np.arange(central.shape[0])              # absolute time, matches the fit
         sel = t < tmax if tmax is not None else np.ones_like(t, dtype=bool)
 
         ax.axhline(1.0, color=GREY, lw=LW, zorder=0)
         if win is not None:
             ax.axvspan(win[0], win[1] - 1, color=BAND, zorder=0)   # fit window
 
-        if np.isfinite(E) and np.isfinite(logA):
-            model = fitModel if fitModel is not None else _EXP_MODEL
-            fit = model(t, E, logA)
-            # a sinh model passes through zero at its crossing; the ratio is
-            # meaningless within noise of that point, so blank it rather than
-            # letting one near-zero division set the panel's scale
-            fit[np.abs(fit) < 1e-12] = np.nan
-            # the periodic factor inside fitCurve carries |.| (the mass fit runs
-            # in log space), so ratio |data| against it: past a sinh crossing the
-            # ratio then returns to +1 instead of sitting at -1 off-panel
-            ratio = (np.abs(central[:, state]) / fit)[sel]
+        if np.all(np.isfinite(params)):
+            ground = model.ground(t, *params)
+            # a sinh ground term passes through zero at its crossing; the ratio
+            # is meaningless within noise of that point, so blank it rather
+            # than letting one near-zero division set the panel's scale
+            ground[np.abs(ground) < 1e-12] = np.nan
+            # the terms are signed, so past a sinh crossing data and ground are
+            # both negative and the ratio returns to +1 on its own
+            ratio = (central[:, state] / ground)[sel]
             # err rows are [high-central, central-low]; matplotlib wants
             # [lower, upper]. A negative entry means the central value fell
             # outside its own bootstrap band (bias at noisy t) — clip that side
             # to zero so the marker still shows the central value.
-            errUp, errDn = np.clip(err[:, sel, state], 0.0, None) / fit[sel]
+            errUp, errDn = np.clip(err[:, sel, state], 0.0, None) / np.abs(ground[sel])
             ax.errorbar(t[sel], ratio, yerr=[errDn, errUp],
                         marker=marker, color=color, mec=color, **eb_kw)
+            # the fit relative to its own ground state: the contamination shape
+            tf = np.linspace(t[sel][0], t[sel][-1], 400)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                fitRatio = model(tf, *params) / model.ground(tf, *params)
+            ax.plot(tf, fitRatio, color=color, lw=LW, zorder=2)
 
             # y-range from the band around the fit region — late-time noise
             # would otherwise dominate the autoscale — with headroom for the
-            # aE label
-            focus = (t[sel] <= win[1]) if win is not None else np.ones(sel.sum(), dtype=bool)
+            # aE label. t = 0 is a contact term the fit never sees; keep it out
+            # of the autoscale too.
+            focus = (t[sel] >= 1) & ((t[sel] <= win[1]) if win is not None else True)
             if focus.any():
                 lo = np.nanmin((ratio - errDn)[focus])
                 hi = np.nanmax((ratio + errUp)[focus])
@@ -575,11 +584,8 @@ def prinCorrelOverFit(prinCorrels, masses, labels=None, state=0, fitT=None,
         if i + nCols >= n:                  # nothing below it — label the x axis
             ax.set_xlabel(xlabel)
         if i % nCols == 0:                  # leftmost of its row
-            # the exponential-specific label would misdescribe a periodic fit
-            defaultY = (rf"$\lambda^{{({state})}}(t) \, / \, \mathrm{{fit}}$"
-                        if fitModel is not None and getattr(fitModel, "periodic", False)
-                        else rf"$\lambda^{{({state})}}(t) \, / \, A\,e^{{-E_{state} t}}$")
-            ax.set_ylabel(ylabel if ylabel is not None else defaultY)
+            ax.set_ylabel(ylabel if ylabel is not None else
+                          rf"$\lambda^{{({state})}}(t) \, / \, \mathrm{{ground}}$")
 
     if title is not None:
         fig.suptitle(title, fontsize=18)

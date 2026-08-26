@@ -3,7 +3,7 @@ from typing import NamedTuple
 import numpy as np
 from joblib import Parallel, delayed
 import joblib
-from scipy.linalg import eig, cho_factor, cho_solve
+from scipy.linalg import eig
 from scipy.optimize import curve_fit, linear_sum_assignment
 from tqdm import tqdm
 
@@ -228,7 +228,7 @@ def bootstrapEnsemble(measured, weights=None, reduce=None, numResamples=10000, s
     return [central, err, cov]
 
 
-def gevp(corrMat, ti=1, sortBy="vector", refVecs=None, labelIdx=1):
+def gevp(corrMat, ti=1, sortBy="vector", refVecs=None, labelIdx=None):
     """Solve the generalized eigenvalue problem C(t) v = lambda(t) C(ti) v.
 
     Args:
@@ -243,22 +243,25 @@ def gevp(corrMat, ti=1, sortBy="vector", refVecs=None, labelIdx=1):
         refVecs: External anchor eigenvectors (n, n), e.g. the ensemble-central
             ones — keeps state labels consistent across bootstrap resamples.
             Defaults to None (derive labels at labelIdx).
-        labelIdx: Curve index (t - ti) where state labels are fixed by
-            descending eigenvalue. Early anchors (1) can mislabel when a heavy
-            state has a large early-time amplitude (e.g. sinh-mixed bases); a
-            later anchor (3-4) orders by asymptotic energy at the cost of more
-            noise in the anchor slice. Defaults to 1.
+        labelIdx: Absolute time slice where state labels are fixed by
+            descending eigenvalue. Early anchors (ti + 1) can mislabel when a
+            heavy state has a large early-time amplitude (e.g. sinh-mixed
+            bases); a later anchor (ti + 3 or 4) orders by asymptotic energy at
+            the cost of more noise in the anchor slice. Defaults to None,
+            meaning ti + 1.
 
     Returns:
-        tuple: (newCorr, vecs) — newCorr is (dimt - ti, n) eigenvalue curves,
-        one column per tracked state; vecs is the (n, n) reference eigenvector
-        matrix used for labeling (pass back as refVecs for resamples).
+        tuple: (newCorr, vecs) — newCorr is (dimt, n) eigenvalue curves indexed
+        by absolute time t (so newCorr[ti] == 1 for every state, and t < ti is
+        the growing side where excited states dominate), one column per tracked
+        state; vecs is the (n, n) reference eigenvector matrix used for labeling
+        (pass back as refVecs for resamples).
     """
     dimt = corrMat.shape[2]
     n = corrMat.shape[0]
     ref = corrMat[:, :, ti]
 
-    gevpOutput = [eig(a=corrMat[:, :, t], b=ref) for t in range(ti, dimt)]
+    gevpOutput = [eig(a=corrMat[:, :, t], b=ref) for t in range(dimt)]
 
     if sortBy == "value":
         newCorr = np.array([np.sort(np.real(ev[0]))[::-1] for ev in gevpOutput])
@@ -277,8 +280,8 @@ def gevp(corrMat, ti=1, sortBy="vector", refVecs=None, labelIdx=1):
         vRef = _refNormalize(np.asarray(refVecs))
     else:
         # reference eigenvectors: at t=ti all eigenvalues are trivially 1, so label
-        # states at a later slice (labelIdx), ordered by descending eigenvalue
-        refIdx = min(labelIdx, len(gevpOutput) - 1) if len(gevpOutput) > 1 else 0
+        # states at a later slice (labelIdx, absolute), ordered by descending eigenvalue
+        refIdx = min(ti + 1 if labelIdx is None else labelIdx, dimt - 1)
         w0, v0 = gevpOutput[refIdx]
         order0 = np.argsort(np.real(w0))[::-1]
         vRef = _refNormalize(v0[:, order0])
@@ -303,9 +306,10 @@ def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
     convention, and logA != 0 measures excited-state contamination at ti.
 
     Args:
-        gevpStatsOut: [mean (dimt-ti, n), errors, covMat (n, dimt-ti, dimt-ti)]
-            as returned by bootstrapEnsemble with a GEVP-curve reduce.
-        fitT: [lo, hi) fit window in curve-index units. Defaults to [1, 10].
+        gevpStatsOut: [mean (dimt, n), errors, covMat (n, dimt, dimt)]
+            as returned by bootstrapEnsemble with a GEVP-curve reduce, indexed
+            by absolute time.
+        fitT: [lo, hi) fit window in absolute time. Defaults to [1, 10].
         ti: GEVP reference slice used to build the curves. Defaults to 1.
         eigenIdx: Which eigenvalue to fit (0 = lowest mass, 1 = next, ...).
             Defaults to 0.
@@ -318,7 +322,8 @@ def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
         window has no positive signal, the bootstrap cov is unavailable, or
         the fit fails — callers can plot the surviving states unconditionally.
     """
-    dimt = gevpStatsOut[0].shape[0] + ti
+    dimt = gevpStatsOut[0].shape[0]
+    lo, hi = fitT
 
     # logA is a free amplitude: the GEVP normalization lambda(ti)=1 is a
     # convention, and pinning the fit through it pushes excited-state
@@ -346,7 +351,7 @@ def gevpMassExtract(gevpStatsOut, fitT=[1,10], ti=1, eigenIdx=0, coshExpr=True):
 
     model = coshCorrel_log if coshExpr else expDecay_log
     try:
-        fitMass = curve_fit(model, xdata=np.arange(fitT[0], fitT[1]),
+        fitMass = curve_fit(model, xdata=np.arange(lo, hi) - ti,   # model variable is t - ti
                     ydata=log_mean, sigma=log_cov, absolute_sigma=True,
                     p0=[0.5, 0.0], bounds=([0, -np.inf], [np.inf, np.inf]))
     except Exception as fitErr:
@@ -377,7 +382,8 @@ def gevpReduce(Cmean, ti=1, refVecs=None, shift=0):
             fit forward-exponential on early times. Defaults to 0.
 
     Returns:
-        np.ndarray: (T - shift - ti, n) eigenvalue curves, one column per state.
+        np.ndarray: (T - shift, n) eigenvalue curves indexed by absolute time,
+        one column per state.
     """
     Csym = 0.5 * (Cmean + np.conj(np.transpose(Cmean, (1, 0, 2))))
     if shift:
@@ -386,7 +392,7 @@ def gevpReduce(Cmean, ti=1, refVecs=None, shift=0):
     return newCorr
 
 
-def makeGevpReduce(ti=1, shift=0, labelIdx=1):
+def makeGevpReduce(ti=1, shift=0, labelIdx=None):
     """Stateful gevpReduce factory for bootstrapping.
 
     The FIRST call of the returned reduce (which bootstrapEnsemble makes on the
@@ -399,11 +405,13 @@ def makeGevpReduce(ti=1, shift=0, labelIdx=1):
     Args:
         ti: GEVP reference slice. Defaults to 1.
         shift: Shift for C(t + shift) - C(t); see gevpReduce. Defaults to 0.
-        labelIdx: Anchor curve index for state labeling; see gevp. Defaults to 1.
+        labelIdx: Absolute anchor slice for state labeling; see gevp. Defaults to
+            None (ti + 1).
 
     Returns:
         Callable[[np.ndarray], np.ndarray]: Reduce mapping a (n, n, T) mean
-        matrix to (T - shift - ti, n) anchored eigenvalue curves.
+        matrix to (T - shift, n) anchored eigenvalue curves indexed by absolute
+        time (row ti is identically 1).
     """
     state = {}
 
@@ -420,208 +428,257 @@ def makeGevpReduce(ti=1, shift=0, labelIdx=1):
     return _reduce
 
 
-def shrinkCov(cov, shrink):
-    """(1-s)*Sigma + s*diag(Sigma): pull a sample covariance toward its diagonal.
+def svdCut(cov, cut):
+    """Floor the small eigenvalues of a covariance's correlation matrix.
 
-    A bootstrap covariance estimated from n_cfg configs over a k-point window is
-    only well conditioned when n_cfg >> k. Below roughly n_cfg/k ~ 10 the
-    off-diagonal structure is largely noise, and a correlated fit that trusts it
-    overfits: it reports smaller errors than its own scatter across independent
-    subsets, and picks up a small bias. Shrinking toward the diagonal keeps most
-    of the gain without that failure mode. s = 0 is pure GLS, s = 1 is
-    variance-only weighting.
+    A bootstrap covariance estimated from n_cfg configs over a k-point window
+    is only trustworthy when n_cfg >> k. Its large eigenvalues come out about
+    right, but the small ones are biased low (Wishart noise), and Sigma^-1 then
+    puts enormous weight on exactly those directions -- combinations of points
+    the data claim to know far better than they do. A correlated fit that
+    trusts them overfits: errors below its own subset-to-subset scatter, and
+    unstable refits across resamples.
+
+    This is the regulator lsqfit/corrfitter use: diagonalise the CORRELATION
+    matrix (so the scale of each point is removed), raise every eigenvalue below
+    cut * lambda_max up to that floor, and transform back. Only the unreliable
+    directions are touched and only ever toward LARGER uncertainty, so it is
+    conservative by construction; the well-measured neighbouring-t correlations
+    are left intact, which is what plain shrinkage toward the diagonal throws
+    away.
+
+    Args:
+        cov: (k, k) covariance.
+        cut: Floor as a fraction of the largest correlation eigenvalue. 0 or
+            None returns cov unchanged (pure GLS); ~1e-3 to 1e-2 is the usual
+            range, larger when n_cfg / k is small.
+
+    Returns:
+        np.ndarray: The regulated (k, k) covariance.
     """
-    if not shrink:
+    if not cut:
         return cov
-    return (1.0 - shrink) * cov + shrink * np.diag(np.diag(cov))
+    d = np.sqrt(np.diag(cov))
+    d[~(d > 0)] = 1.0                   # a zero-variance row is left as is
+    corr = cov / np.outer(d, d)
+    w, v = np.linalg.eigh(corr)
+    w = np.maximum(w, cut * w.max())
+    return (v * w) @ v.T * np.outer(d, d)
 
 
-def _glsSolve(X, y, cov):
-    """Generalised least squares beta = (X^T S^-1 X)^-1 X^T S^-1 y.
-
-    Falls back to variance-only weights if the Cholesky fails, so a singular
-    window degrades to the diagonal fit rather than returning NaN.
-    """
-    try:
-        c = cho_factor(cov)
-        invX, invY = cho_solve(c, X), cho_solve(c, y)
-    except Exception:
-        d = np.diag(cov).astype(float).copy()
-        d[~(d > 0)] = np.inf
-        invX, invY = X / d[:, None], y / d
-    return np.linalg.solve(X.T @ invX, X.T @ invY)
+_svdCut = svdCut        # massReduce/bootstrapMasses take a kwarg of the same name
 
 
-def _fitLogLinear(curve, fitT, logCov=None):
-    """Two-parameter log-linear fit of one eigenvalue curve.
+def _fitLogLinear(curve, fitT, ti=1):
+    """Unweighted log-linear fit of one eigenvalue curve, used as a fit seed.
 
     Args:
-        curve: (T',) eigenvalue curve.
-        fitT: (lo, hi) window in curve-index units; fits on [lo, hi).
-        logCov: (k, k) covariance of log(curve) over the window, or None for an
-            unweighted fit. The model is linear in log space, so the weighted
-            case is a closed-form GLS solve rather than an optimisation.
+        curve: (T,) eigenvalue curve indexed by absolute time.
+        fitT: (lo, hi) window in absolute time; fits on [lo, hi).
+        ti: GEVP reference slice. The fit variable is t - ti, so logA is the
+            log-amplitude at ti (0 for an uncontaminated state). Defaults to 1.
 
     Returns:
-        tuple[float, float]: (energy, logA) so that curve ~ exp(logA - energy * t);
-        (nan, nan) if the window has non-positive or non-finite values (signal
-        lost to noise) or fewer than 2 points.
+        tuple[float, float]: (energy, logA) so that
+        curve ~ exp(logA - energy * (t - ti)), from the positive finite points
+        of the window only; (nan, nan) if fewer than 2 remain.
     """
-    y = curve[fitT[0]:fitT[1]]
-    if len(y) < 2 or np.any(y <= 0) or not np.all(np.isfinite(y)):
-        return np.nan, np.nan
     ts = np.arange(fitT[0], fitT[1])
-    if logCov is None:
-        slope, intercept = np.polyfit(ts, np.log(y), 1)
-        return -slope, intercept
-    #columns [1, -t] so beta is (logA, energy) directly
-    X = np.column_stack([np.ones_like(ts, dtype=float), -ts.astype(float)])
-    logA, energy = _glsSolve(X, np.log(y), logCov)
-    return energy, logA
-
-
-def _backwardFactor(E, ts, ti, dimt, shift, sign):
-    """The periodic image's contribution relative to the forward exponential.
-
-    A single state on a periodic lattice contributes both e^{-E tau} and its
-    around-the-torus image, so writing the curve as (forward) x (this factor)
-    keeps E and logA meaning the same thing for every fit form:
-
-        exp:  1
-        cosh: 1 + e^{-E(T - 2 tau)}          symmetric, sign = +1
-        sinh: 1 - e^{-E(T - 2 tau - shift)}  antisymmetric, sign = -1
-
-    The sinh case is what a shift produces: C(tau+s) - C(tau) of a cosh is a
-    sinh centred at (T - s)/2, so the factor passes through zero there and the
-    curve changes sign.
-
-    Args:
-        E: Energy.
-        ts: (k,) curve-index times.
-        ti: GEVP reference slice, so actual time is tau = t + ti.
-        dimt: Full temporal extent T.
-        shift: The shift used to build the curve.
-        sign: +1 for cosh, -1 for sinh, 0 for a pure forward exponential.
-
-    Returns:
-        np.ndarray: The factor at each time, with |.| applied so the log-space
-        fit survives past a sinh's zero crossing.
-    """
-    if sign == 0:
-        return np.ones_like(np.asarray(ts, dtype=float))
-    tau = np.asarray(ts, dtype=float) + ti
-    return np.abs(1.0 + sign * np.exp(-E * (dimt - 2.0 * tau - shift)))
+    y = curve[fitT[0]:fitT[1]]
+    ok = np.isfinite(y) & (y > 0)
+    if ok.sum() < 2:
+        return np.nan, np.nan
+    slope, intercept = np.polyfit(ts[ok] - ti, np.log(y[ok]), 1)
+    return -slope, intercept
 
 
 _FIT_SIGNS = {"exp": 0, "cosh": 1, "sinh": -1}
 
 
-def _fitPeriodic(curve, fitT, ti, dimt, shift, sign, logCov=None):
-    """Two-parameter fit of one eigenvalue curve including its periodic image.
+def _twoExpModel(ti, dimt, shift, sign):
+    """The three-parameter shape massReduce fits to a GEVP principal correlator.
 
-    Same (E, logA) parameterisation as _fitLogLinear — the model is
-    exp(logA - E t) * _backwardFactor(...) — so the extra term costs no extra
-    parameter. Fitted in log space, like the exponential case, and seeded from
-    the log-linear fit.
+    A principal correlator normalised at ti carries a ground state plus, at
+    early times, whatever excited-state admixture the GEVP could not resolve.
+    Two states, each with its periodic image, written so the normalisation
+    lambda(ti) = 1 is built in rather than fitted:
+
+        g_E(t)    = e^{-E (t - ti)} (1 + s e^{-E (T - 2t - shift)})
+        lambda(t) = [(1 - A) g_m(t) + A g_{m+dm}(t)] / [(1 - A) g_m(ti) + A g_{m+dm}(ti)]
+
+    with s = 0 / +1 / -1 for exp / cosh / sinh. Parameters [m, dm, A]: the
+    ground-state mass, the gap to the contaminating state, and its weight at
+    ti (fitted within [-1, 1/2]: the state at ti is mostly the ground state).
+    For t < ti the excited term GROWS fastest, which is what pins dm.
 
     Args:
-        curve: (T',) eigenvalue curve.
-        fitT: (lo, hi) window in curve-index units; fits on [lo, hi).
         ti: GEVP reference slice.
-        dimt: Full temporal extent T.
+        dimt: Full temporal extent T of the (unshifted) lattice.
         shift: The shift used to build the curve.
-        sign: +1 cosh, -1 sinh.
+        sign: 0 forward exponential, +1 cosh, -1 sinh.
 
     Returns:
-        tuple[float, float]: (energy, logA); (nan, nan) if the window has no
-        usable positive signal or the fit fails.
+        Callable[[array, float, float, float], array]: f(t, m, dm, A) over
+        absolute time t, with a `.periodic` flag for the plots and a
+        `.ground(t, m, dm, A)` attribute giving the ground-state term alone,
+        so that f / f.ground = 1 + A/(1-A) g_{m+dm}/g_m is the contamination.
     """
-    y = curve[fitT[0]:fitT[1]]
-    if len(y) < 2 or np.any(y <= 0) or not np.all(np.isfinite(y)):
-        return np.nan, np.nan
-    E0, logA0 = _fitLogLinear(curve, fitT, logCov)   # exponential seed
-    if not np.isfinite(E0):
-        return np.nan, np.nan
-    ts = np.arange(fitT[0], fitT[1])
+    def g(E, t):
+        f = np.exp(-E * (t - ti))
+        if sign:
+            f = f * (1.0 + sign * np.exp(-E * (dimt - 2.0 * t - shift)))
+        return f
 
-    def logModel(t, E, logA):
-        with np.errstate(divide="ignore"):
-            return logA - E * t + np.log(_backwardFactor(E, t, ti, dimt, shift, sign))
+    def model(t, m, dm, A):
+        t = np.asarray(t, dtype=float)
+        num = (1.0 - A) * g(m, t) + A * g(m + dm, t)
+        den = (1.0 - A) * g(m, ti) + A * g(m + dm, ti)
+        return num / den
 
-    # E >= 0: the periodic forms are exactly degenerate under E -> -E (the
-    # curve is symmetric/antisymmetric about its centre), so a window reaching
-    # past the centre can otherwise converge to the mirror solution. Same bound
-    # gevpMassExtract uses. The seed can be negative there (log-linear slope of
-    # a rising curve), so clip it into the feasible region.
-    #a 2-D sigma is a covariance matrix to curve_fit, which whitens with it
+    def ground(t, m, dm, A):
+        """The ground-state term alone, with the fit's normalisation."""
+        t = np.asarray(t, dtype=float)
+        den = (1.0 - A) * g(m, ti) + A * g(m + dm, ti)
+        return (1.0 - A) * g(m, t) / den
+
+    model.periodic = sign != 0
+    model.ground = ground
+    return model
+
+
+def _fitTwoExp(curve, fitT, ti, dimt, shift, sign, preTi=1, cov=None, p0=None):
+    """Direct (linear-space) fit of one eigenvalue curve to _twoExpModel.
+
+    Fitted on the data itself, not its log: a noisy point that has fluctuated
+    negative is a point with a large residual, not a NaN that kills the state.
+    The fitted points are the slices preTi <= t < ti plus the window [lo, hi);
+    t = ti is always dropped, since lambda(ti) = 1 exactly on every resample
+    and carries no information (and a zero-variance row in cov).
+
+    Args:
+        curve: (T,) eigenvalue curve indexed by absolute time.
+        fitT: (lo, hi) window in absolute time, lo > ti.
+        ti, dimt, shift, sign: As _twoExpModel.
+        preTi: First pre-ti slice to include, or None for none. Defaults to 1:
+            t = 0 is a contact term on the lattice (and, shifted, C(1) - C(0)
+            has the wrong sign), not part of the state tower.
+        cov: (k, k) covariance over the fitted points, in their order, already
+            regulated; or None. Without it the fit is weighted by |y| — a
+            relative-error weighting, first-order equivalent to the old
+            log-space fit — because a truly unweighted linear fit would be
+            dominated by the largest points and ignore the plateau.
+        p0: Starting [m, dm, A], e.g. the central fit when refitting a
+            resample; None seeds from a log-linear fit of the window. A
+            resample sits a few percent from the central solution, so starting
+            there removes the slow tail of resamples that otherwise wander
+            along the A bound for hundreds of iterations.
+
+    Returns:
+        np.ndarray: [m, dm, A]; all NaN if fewer than 4 finite points remain or
+        the optimiser fails.
+    """
+    ts = _fitTimes(fitT, ti, preTi)
+    y = curve[ts]
+    ok = np.isfinite(y)
+    if ok.sum() < 4:
+        return np.full(3, np.nan)
+    if cov is not None and not ok.all():
+        return np.full(3, np.nan)          # weights were built for the full set
+    ts, y = ts[ok], y[ok]
+
+    lower, upper = [0, 0, -1], [np.inf, np.inf, 0.5]
+    if p0 is None or not np.all(np.isfinite(p0)):
+        m0, _ = _fitLogLinear(curve, fitT, ti)
+        if not np.isfinite(m0) or m0 <= 0:
+            m0 = 0.5
+        p0 = [m0, m0, 0.1]
+    # a central fit that ended on a bound seeds just inside it
+    p0 = np.clip(p0, np.array(lower) + 1e-9, np.array(upper) - 1e-9)
+
+    if cov is None:
+        sigma = np.maximum(np.abs(y), 1e-3 * np.max(np.abs(y)))   # floor near a sinh crossing
+    else:
+        sigma = cov
+    model = _twoExpModel(ti, dimt, shift, sign)
+    # Bounds are what make the parameters identifiable: (A, dm) -> (1 - A, -dm)
+    # is the same curve, so dm >= 0 fixes which state is "excited"; and at
+    # A = 1 the ground term vanishes and m is free, so A <= 1/2 keeps the state
+    # at ti mostly the ground state. m >= 0 removes the periodic forms' E -> -E
+    # mirror.
     try:
-        p, _ = curve_fit(logModel, ts, np.log(y), p0=[max(E0, 1e-6), logA0],
-                         bounds=([0, -np.inf], [np.inf, np.inf]), maxfev=20000,
-                         sigma=logCov, absolute_sigma=logCov is not None)
+        with np.errstate(over="ignore", invalid="ignore"):
+            # 1e-6 tolerances: the default 1e-8 costs ~10x the evaluations on
+            # resamples where A ~ 0 leaves dm unconstrained (a flat valley the
+            # optimiser creeps along), for parameter changes far below any
+            # bootstrap error. maxfev is a safety net, not a convergence knob.
+            p, _ = curve_fit(model, ts, y, p0=p0, sigma=sigma, absolute_sigma=True,
+                             bounds=(lower, upper), maxfev=2000, ftol=1e-6, xtol=1e-6)
     except Exception:
-        if logCov is None:
-            return np.nan, np.nan
-        #a singular window should degrade to the unweighted fit, not to NaN
-        try:
-            p, _ = curve_fit(logModel, ts, np.log(y), p0=[max(E0, 1e-6), logA0],
-                             bounds=([0, -np.inf], [np.inf, np.inf]), maxfev=20000)
-        except Exception:
-            return np.nan, np.nan
-    return p[0], p[1]
+        return np.full(3, np.nan)
+    return np.asarray(p, dtype=float)
 
 
-def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False, labelIdx=1, fitForm="exp",
-               cov=None, covShrink=0.0):
+def _fitTimes(fitT, ti, preTi):
+    """Absolute times a fit uses: slices preTi <= t < ti (if preTi is not None)
+    plus the window [lo, hi), never t = ti."""
+    ts = np.arange(fitT[0], fitT[1])
+    if preTi is not None:
+        ts = np.concatenate([np.arange(preTi, ti), ts])
+    return ts[ts != ti]
+
+
+def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False, labelIdx=None, fitForm="exp",
+               preTi=1, cov=None, svdCut=None):
     """Reduce factory for bootstrapEnsemble that goes all the way to masses.
 
-    Anchored GEVP (optionally shifted), then a two-parameter fit per state.
-    Because the fit is redone on every resample, the bootstrap distribution of
-    the mass exactly marginalizes the amplitude (and inherits all data
-    correlations). Via bootstrapEnsemble the mass covariance is useful for
-    splittings like E_pipi - 2 E_pi.
+    Anchored GEVP (optionally shifted), then a three-parameter two-exponential
+    fit per state (see _twoExpModel), done directly on the curve rather than
+    its log. Because the fit is redone on every resample, the bootstrap
+    distribution of the mass exactly marginalizes the other parameters (and
+    inherits all data correlations). Via bootstrapEnsemble the mass covariance
+    is useful for splittings like E_pipi - 2 E_pi.
 
     Args:
         ti: GEVP reference slice. Defaults to 1.
         shift: Shift for C(t + shift) - C(t); see gevpReduce. Defaults to 0.
-        fitT: Fit window(s) in curve-index units of the (shifted) GEVP output:
-            one (lo, hi) pair for all states, or a list of per-state pairs
-            (excited states need earlier/shorter windows than the ground
-            state). Defaults to (2, 8).
+        fitT: Fit window(s) in absolute time on the (shifted) GEVP output,
+            lo > ti: one (lo, hi) pair for all states, or a list of per-state
+            pairs (excited states need earlier/shorter windows than the ground
+            state). The pre-ti slices are added automatically; see preTi.
+            Defaults to (2, 8).
         withAmp: If False, the reduce returns (n_states,) masses and
             bootstrapEnsemble's cov is the (n, n) mass covariance. If True, it
-            returns (n_states, 2) with columns [E, logA] — the fitted curve is
-            exp(logA - E * t) times the periodic factor for this fitForm, in the
-            (shifted) curve's time units — and cov becomes (2, n, n): [0] mass
-            cov, [1] logA cov. Defaults to False.
-        labelIdx: Anchor curve index for state labeling; see gevp. Defaults to 1.
-        fitForm: Which single-state shape to fit, all two-parameter:
+            returns (n_states, 3) with columns [m, dm, A] (see _twoExpModel)
+            and cov becomes (3, n, n). Defaults to False.
+        labelIdx: Absolute anchor slice for state labeling; see gevp. Defaults to
+            None (ti + 1).
+        fitForm: Which single-state shape each of the two states has:
             "exp"  forward exponential only. Correct just where the periodic
                    image is negligible, so it needs an early, short window.
             "cosh" symmetric periodic form, for shift = 0 with operators whose
                    correlator is symmetric about T/2.
             "sinh" antisymmetric form centred at (T - shift)/2, which is what a
-                   shift > 0 produces from a cosh.
+                   shift > 0 produces from a cosh. The fit is direct, so the
+                   window may run through the sign change.
             "auto" "sinh" when shift > 0, else "cosh".
-            The periodic forms cost no extra parameter and let the window run to
-            much larger t, which matters most on short lattices. Defaults to
-            "exp", preserving the previous behaviour.
-        cov: (n_states, T', T') covariance of the GEVP curves, i.e. element [2]
+            Defaults to "exp".
+        preTi: First of the t < ti slices to fit as well -- where the excited
+            state dominates and dm is actually constrained -- or None to fit
+            the window only (then the third parameter is essentially
+            unconstrained and the fit degenerates; keep it on). Defaults to 1:
+            t = 0 is a contact term and must stay out.
+        cov: (n_states, T, T) covariance of the GEVP curves, i.e. element [2]
             of a prior bootstrapEnsemble run with makeGevpReduce at the SAME
-            ti/shift. Given, the plateau fits become correlated (GLS) instead of
-            unweighted, which on this repo's ensembles narrows the mass error by
-            1.3-2.2x at no extra cost -- the same data, better weighted. The
-            weight matrix is built once from the central curve, so every
-            resample is fit with identical weights. Defaults to None
-            (unweighted, the previous behaviour).
-        covShrink: Pull cov toward its diagonal by this fraction before use; see
-            shrinkCov. Use ~0.2-0.3 when n_cfg over the window length falls
-            below ~10 (e.g. the 100-config Nx=48/64 caches on a 23-point
-            window), where an unshrunk correlated fit reports errors smaller
-            than its own subset-to-subset scatter. Defaults to 0.0.
+            ti/shift. Given, the fits become correlated (GLS) instead of
+            |y|-weighted. The weight matrix is built once from the central
+            curve, so every resample is fit with identical weights. Defaults
+            to None.
+        svdCut: Regulator for each state's fit-point covariance; see the svdCut
+            function. Defaults to None (pure GLS).
 
     Returns:
         Callable[[np.ndarray], np.ndarray]: Reduce mapping a (n, n, T) mean
-        matrix to (n_states,) masses (or (n_states, 2) with withAmp);
+        matrix to (n_states,) masses (or (n_states, 3) with withAmp);
         failed fits yield NaN for that state only.
 
     Raises:
@@ -637,22 +694,16 @@ def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False, labelIdx=1, fitForm="e
     perState = isinstance(fitT[0], (tuple, list))
     state = {}
 
-    def _logCovs(curves, windows):
-        """Per-state log-space covariance over each fit window, built once.
-
-        Sigma_log[i,j] = Sigma_lin[i,j] / (lam_i * lam_j) to first order, taken
-        on the CENTRAL curve so the weight matrix is the same for every
-        resample -- a per-resample weight matrix would make the estimator
-        depend on its own noise.
-        """
+    def _covs(windows):
+        """Per-state covariance over each state's fit points, built once."""
         out = []
         for e, w in enumerate(windows):
-            lam = curves[w[0]:w[1], e]
-            sub = np.asarray(cov)[e][w[0]:w[1], w[0]:w[1]]
-            if np.any(lam <= 0) or not np.all(np.isfinite(sub)):
-                out.append(None)                     # no signal: fit unweighted
+            ts = _fitTimes(w, ti, preTi)
+            sub = np.asarray(cov)[e][np.ix_(ts, ts)]
+            if not np.all(np.isfinite(sub)):
+                out.append(None)                     # no signal: fit |y|-weighted
                 continue
-            out.append(shrinkCov(sub / np.outer(lam, lam), covShrink))
+            out.append(_svdCut(sub, svdCut))
         return out
 
     def _reduce(Cmean, withAmp=withAmp):
@@ -661,21 +712,21 @@ def massReduce(ti=1, shift=0, fitT=(2, 8), withAmp=False, labelIdx=1, fitForm="e
         windows = fitT if perState else [fitT] * curves.shape[1]
         #bootstrapEnsemble calls the reduce on the central mean first, so this
         #is where the covariance is anchored -- the same hook makeGevpReduce
-        #uses for its state-label reference vectors
-        if "logCov" not in state:
-            state["logCov"] = (_logCovs(curves, windows) if cov is not None
-                               else [None] * curves.shape[1])
-        lc = state["logCov"]
-        if sign == 0:
-            fits = np.array([_fitLogLinear(curves[:, e], w, lc[e])
-                             for e, w in enumerate(windows)])   # (n, 2)
-        else:
-            fits = np.array([_fitPeriodic(curves[:, e], w, ti, dimt, shift, sign, lc[e])
-                             for e, w in enumerate(windows)])   # (n, 2)
+        #uses for its state-label reference vectors -- and where the central
+        #fit is kept to seed every resample's fit
+        first = "cov" not in state
+        if first:
+            state["cov"] = (_covs(windows) if cov is not None
+                            else [None] * curves.shape[1])
+        cs = state["cov"]
+        seeds = [None] * curves.shape[1] if first else state["central"]
+        fits = np.array([_fitTwoExp(curves[:, e], w, ti, dimt, shift, sign, preTi, cs[e], seeds[e])
+                         for e, w in enumerate(windows)])   # (n, 3)
+        if first:
+            state["central"] = list(fits)
         return fits if withAmp else fits[:, 0]
 
     return _reduce
-
 
 class MassFit(NamedTuple):
     """Output of bootstrapMasses: both bootstrap passes, plus what it chose.
@@ -687,19 +738,19 @@ class MassFit(NamedTuple):
     """
     masses: list        # [central, err, cov] of the plateau fits
     curves: list        # [central, err, cov] of the GEVP principal correlators
-    covShrink: float    # shrinkage actually applied (see shrinkCov)
+    svdCut: float       # SVD cut actually applied (see svdCut)
     correlated: bool    # whether the plateau fits ended up weighted at all
 
 
 def bootstrapMasses(measured, ti=1, shift=0, fitT=(2, 8), fitForm="exp", withAmp=False,
-                    labelIdx=1, weights=None, numResamples=10000, covResamples=None,
+                    preTi=1, labelIdx=None, weights=None, numResamples=2000, covResamples=None,
                     seed=None, progress=True, quantile=0.68,
-                    correlated=True, covShrink="auto"):
+                    correlated=True, svdCut=1e-3):
     """GEVP curves and correlated plateau masses in one call.
 
     Runs the two bootstrap passes that a correlated fit needs and hides the
     plumbing between them: the first pass reduces to principal correlators and
-    yields their covariance, the second refits the plateaus using that
+    yields their covariance, the second refits the curves using that
     covariance as fixed weights.
 
     Why two passes, and why the weights are fixed: a single resample is one
@@ -718,28 +769,30 @@ def bootstrapMasses(measured, ti=1, shift=0, fitT=(2, 8), fitForm="exp", withAmp
     Args:
         measured: Output of measureEnsemble.
         ti, shift, labelIdx: GEVP settings; see gevpReduce and gevp.
-        fitT, fitForm, withAmp: Plateau fit settings; see massReduce.
+        fitT, fitForm, withAmp, preTi: Fit settings; see massReduce.
         weights: (n_cfg,) reweighting factors, applied to BOTH passes so the
             covariance describes the same (reweighted) ensemble as the fit.
-        numResamples: Resamples for the mass pass. Defaults to 10000.
+        numResamples: Resamples for the mass pass. Defaults to 2000: a 68%
+            quantile from 2000 resamples carries a ~3% relative error on the
+            error bar, below anything read off a plot, at a fifth of the cost
+            of bootstrapEnsemble's 10000 (every resample is a GEVP plus a
+            fit per state).
         covResamples: Resamples for the covariance pass. Defaults to
             min(numResamples, 2000) -- the covariance converges long before the
             quantiles do, so there is no reason to pay full price twice.
         seed, progress, quantile: As bootstrapEnsemble.
         correlated: False skips the covariance pass entirely and reproduces an
             unweighted massReduce exactly. Defaults to True.
-        covShrink: Shrinkage toward the diagonal; see shrinkCov. "auto" uses
-            windowLength / n_cfg, which is the scale at which a sample
-            covariance stops being trustworthy: ~0.05 on the 400-config caches
-            (essentially pure GLS) and ~0.2 on the 100-config Nx=48/64 ones,
-            where an unshrunk correlated fit reports errors below its own
-            subset-to-subset scatter. Defaults to "auto".
+        svdCut: Floor for the small eigenvalues of each window's correlation
+            matrix, as a fraction of the largest; see the svdCut function. The
+            eigenvalues a sample covariance gets wrong are the smallest ones, so
+            this is what keeps a correlated fit from over-trusting them on the
+            100-config Nx=48/64 caches. Defaults to 1e-3; raise it (1e-2) if
+            refits scatter across resamples, 0/None for pure GLS.
 
     Returns:
-        MassFit: .masses, .curves, .covShrink, .correlated.
+        MassFit: .masses, .curves, .svdCut, .correlated.
     """
-    nCfg = len(measured["conn"])
-
     curves = bootstrapEnsemble(
         measured, weights=weights,
         reduce=makeGevpReduce(ti=ti, shift=shift, labelIdx=labelIdx),
@@ -749,20 +802,18 @@ def bootstrapMasses(measured, ti=1, shift=0, fitT=(2, 8), fitForm="exp", withAmp
     #cov is None when too few resamples stayed jointly finite; that is a signal
     #the curves are too noisy to weight with, so fall back to the plain fit
     cov = curves[2] if correlated else None
-    if covShrink == "auto":
-        windows = fitT if isinstance(fitT[0], (tuple, list)) else [fitT]
-        width = max(hi - lo for lo, hi in windows)
-        covShrink = 0.0 if cov is None else min(0.9, width / max(nCfg, 1))
+    if cov is None:
+        svdCut = 0.0
 
     masses = bootstrapEnsemble(
         measured, weights=weights,
         reduce=massReduce(ti=ti, shift=shift, fitT=fitT, withAmp=withAmp,
-                          labelIdx=labelIdx, fitForm=fitForm,
-                          cov=cov, covShrink=covShrink),
+                          labelIdx=labelIdx, fitForm=fitForm, preTi=preTi,
+                          cov=cov, svdCut=svdCut),
         numResamples=numResamples, seed=seed, progress=progress, quantile=quantile)
 
     return MassFit(masses=masses, curves=curves,
-                   covShrink=float(covShrink), correlated=cov is not None)
+                   svdCut=float(svdCut or 0.0), correlated=cov is not None)
 
 
 
